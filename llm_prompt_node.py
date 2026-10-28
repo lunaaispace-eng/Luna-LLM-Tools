@@ -1,0 +1,2557 @@
+
+"""Luna-LLMPrompt â€” ComfyUI node for prompt generation via GGUF vision models.
+
+Built on the proven QwenVL-Mod GGUF inference code. Adds:
+  - System prompt presets from .md files in prompts/ folder
+  - User prompt (multiline text input)
+  - Style input (STRING from external nodes)
+  - Width/height aspect ratio auto-detection
+  - Output format toggle (text/json)
+"""
+
+import base64
+import gc
+import inspect
+import logging
+import os
+import re
+import struct
+import threading
+import time
+from io import BytesIO
+from pathlib import Path
+
+import numpy as np
+import torch
+from PIL import Image
+
+# llama-cpp-python is only needed by the local GGUF node. Import it lazily/guarded
+# so a broken or missing wheel (the WinError 127 / DLL saga) can't take down the
+# WHOLE pack — the cloud API node and Grok nodes must still load. The GGUF node
+# raises a clear error at model-load time if Llama is unavailable.
+try:
+    from llama_cpp import Llama
+    _LLAMA_IMPORT_ERROR = None
+except Exception as _e:  # noqa: BLE001 — any import/DLL failure must stay non-fatal
+    Llama = None
+    _LLAMA_IMPORT_ERROR = _e
+
+# MTP speculative decoding (JamePeng 0.3.48+). Older wheels lack it; the node then
+# simply runs without MTP.
+try:
+    from llama_cpp.llama_speculative import SpecConfig, SpeculativeType
+except Exception:  # noqa: BLE001
+    SpecConfig = None
+    SpeculativeType = None
+
+import folder_paths
+from comfy_api.latest import io
+
+# Bundled output cleaner â€” no external dependencies
+from .output_cleaner import OutputCleanConfig, clean_model_output, normalize_prompt_separator, split_positive_negative
+from .h3_validate import validate_h3, format_log
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+NODE_DIR = Path(__file__).parent
+PROMPTS_DIR = NODE_DIR / "prompts"
+
+# No-think ChatML template for Qwen (text-only). This replicates the manual
+# LM Studio template edit that reliably disables thinking: it pre-fills an EMPTY
+# <think></think> block on the assistant turn, so the model continues straight
+# to the answer with no reasoning. We pass this to llama-cpp ourselves when
+# disable_thinking is on, so thinking-off works regardless of whether the GGUF's
+# embedded template exposes `enable_thinking` or whether chat_template_kwargs is
+# supported by the installed llama-cpp-python build. Qwen uses ChatML tokens
+# (<|im_start|> / <|im_end|>); content is plain text on this path (no vision).
+_QWEN_NO_THINK_CHATML = (
+    "{%- for message in messages %}"
+    "{{- '<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>\\n' }}"
+    "{%- endfor %}"
+    "{%- if add_generation_prompt %}"
+    "{{- '<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n' }}"
+    "{%- endif %}"
+)
+# Aspect ratio mapping: (w_ratio, h_ratio) -> label
+_ASPECT_LABELS = {
+    (1, 1):   "1:1 square",
+    (4, 5):   "4:5 portrait",
+    (5, 4):   "5:4 landscape",
+    (3, 4):   "3:4 portrait",
+    (4, 3):   "4:3 landscape",
+    (2, 3):   "2:3 portrait",
+    (3, 2):   "3:2 landscape",
+    (9, 16):  "9:16 portrait",
+    (16, 9):  "16:9 landscape",
+    (21, 9):  "21:9 landscape",
+    (9, 21):  "9:21 portrait",
+}
+
+
+def _detect_aspect_ratio(width: int, height: int) -> str:
+    """Convert pixel dimensions to a composition-intent aspect ratio label.
+
+    Kept for back-compat. New code should call _build_canvas_profile() which
+    returns a richer multi-line profile that guides the LLM toward composition,
+    framing, depth, and camera choices appropriate for the canvas shape.
+    """
+    from math import gcd
+    g = gcd(width, height)
+    w_r, h_r = width // g, height // g
+
+    if (w_r, h_r) in _ASPECT_LABELS:
+        return _ASPECT_LABELS[(w_r, h_r)]
+
+    actual = width / height
+    best_label = None
+    best_diff = float("inf")
+    for (wr, hr), label in _ASPECT_LABELS.items():
+        diff = abs(actual - wr / hr)
+        if diff < best_diff:
+            best_diff = diff
+            best_label = label
+
+    if best_diff < 0.05:
+        return best_label
+
+    if width > height:
+        return f"{w_r}:{h_r} landscape"
+    elif height > width:
+        return f"{w_r}:{h_r} portrait"
+    return f"{w_r}:{h_r} square"
+
+
+def _classify_canvas_shape(width: int, height: int) -> str:
+    """Bucket the canvas into a shape category that drives composition rules.
+
+    Buckets (by aspect ratio = width / height):
+      ultra_tall   : <= 0.50    (9:21 and taller)
+      tall         : 0.51-0.70  (9:16, 2:3 — a full standing figure fits naturally)
+      portrait     : 0.71-0.95  (3:4, 4:5 — 3/4-length; a full head-to-toe figure elongates here)
+      square       : 0.95-1.05  (1:1 and near-square)
+      landscape    : 1.05-1.40  (5:4, 4:3, 3:2 photographic)
+      cinematic    : 1.41-1.90  (16:9 and similar widescreen)
+      ultra_wide   : >= 1.91    (21:9, 32:9, anamorphic)
+    """
+    if width <= 0 or height <= 0:
+        return "unknown"
+    ratio = width / height
+    if ratio <= 0.50:
+        return "ultra_tall"
+    if ratio <= 0.70:                      # 9:16, 2:3 — a full standing figure is natural here
+        return "tall"
+    if ratio <= 0.95:                      # 3:4, 4:5 — 3/4-length; a full figure would elongate
+        return "portrait"
+    if ratio <= 1.05:
+        return "square"
+    if ratio <= 1.40:
+        return "landscape"
+    if ratio <= 1.90:
+        return "cinematic"
+    return "ultra_wide"
+
+
+# Composition profiles per shape — model-independent guidance.
+# These describe what to DO with the canvas shape, not what to do for any
+# specific generator (SD/SDXL/Flux/Wan/LTX). Detail density is intentionally
+# left out because it depends on the target model and is the user's call.
+_CANVAS_PROFILES = {
+    "ultra_tall": {
+        "framing": "extreme vertical — full-body or head-to-toe, subject dominates the column",
+        "composition": "strong vertical emphasis, subject centered horizontally, layered vertical depth",
+        "camera": "85-135mm portrait lens feel, shallow depth of field, compressed perspective",
+        "depth": "shallow — clean separation between subject and background",
+        "avoid": "panoramic vistas, wide horizontal sweeps, group compositions, environmental establishing shots",
+    },
+    "tall": {
+        "framing": "full-body / head-to-feet portrait — the standing figure fits naturally, feet near the lower edge, subject fills most of the frame height",
+        "composition": "vertical emphasis, subject anchored center or rule-of-thirds vertical",
+        "camera": "85mm portrait lens feel, shallow to medium depth of field",
+        "depth": "shallow — background softly blurred, subject in sharp focus",
+        "avoid": "wide environmental shots, panoramic landscapes, lateral camera motion",
+    },
+    "portrait": {
+        "framing": "three-quarter-length to medium portrait — frame the subject from roughly the knees or thighs up, prominent; do NOT force a full head-to-toe standing figure (it stretches the body)",
+        "composition": "subject-forward, modest vertical bias",
+        "camera": "50-85mm normal-to-portrait lens feel, moderate depth of field",
+        "depth": "moderate — subject sharp, environment softened but recognizable",
+        "avoid": "wide vistas, complex multi-subject scenes, full head-to-toe standing figures (causes leg/body elongation)",
+    },
+    "square": {
+        "framing": "tight centered subject, minimal environment, headshot or product-style framing",
+        "composition": "centered, symmetrical balance, single focal point",
+        "camera": "50-85mm normal lens feel, controlled depth",
+        "depth": "moderate to shallow — subject is the entire focus",
+        "avoid": "off-center subjects, panoramic compositions, sprawling environments",
+    },
+    "landscape": {
+        "framing": "medium shot, subject within scene, room for environmental context",
+        "composition": "rule-of-thirds, subject can be centered or offset, balanced horizontal flow",
+        "camera": "35-50mm normal lens feel, moderate depth of field",
+        "depth": "moderate — subject and environment both rendered with clarity",
+        "avoid": "extreme verticality, towering compositions, claustrophobic framing",
+    },
+    "cinematic": {
+        "framing": "medium to wide shot, subject within environment, cinematic establishing feel",
+        "composition": "rule-of-thirds horizontal, leading lines, layered foreground-midground-background",
+        "camera": "24-35mm wide lens feel, deeper depth of field, slight perspective compression",
+        "depth": "deep to moderate — environment matters as much as subject",
+        "avoid": "tight vertical framing, towering portrait composition, single-element close-ups",
+    },
+    "ultra_wide": {
+        "framing": "wide environmental shot, panoramic sweep, subject occupies a portion of the horizontal expanse",
+        "composition": "strong horizontal flow, panoramic balance, lateral leading lines, anamorphic feel",
+        "camera": "21-24mm wide lens or anamorphic 2.39:1 cinematic, deep depth of field",
+        "depth": "deep — full environmental rendering, foreground to far background",
+        "avoid": "vertical subject emphasis, head-to-toe portraits, tight close-ups, centered single-subject framing",
+    },
+}
+
+
+def _build_canvas_profile(width: int, height: int) -> str:
+    """Aspect-ratio SHAPE HINT only.
+
+    The node states the frame shape (the one FACT the LLM needs, since the bbox
+    grid is aspect-blind). It deliberately does NOT dictate framing, lens, depth,
+    or shot type — hardcoding those fought the user's prompt and made results worse
+    (e.g. forcing a 'wide shot' on 16:9). Composition is owned by the user prompt +
+    the system-prompt's own rules.
+    """
+    if width <= 0 or height <= 0:
+        return ""
+    return f"CANVAS FORMAT: {_detect_aspect_ratio(width, height)} ({width}x{height})."
+
+# ---------------------------------------------------------------------------
+# System prompt loading from .md files
+# ---------------------------------------------------------------------------
+
+def load_system_prompts() -> dict[str, str]:
+    """Load all .md files from prompts/ folder, then prompts/private/.
+
+    Each file becomes a preset. Optional YAML frontmatter (between --- markers)
+    can set: title: Display Name Override
+
+    prompts/private/ is git-ignored: presets that are fine to use locally but
+    must not be published (e.g. third-party prompts licensed "use in your own
+    projects, do not republish"). Their titles get a "Private: " prefix so they
+    never collide with a published preset.
+    """
+    prompts = {}
+    if not PROMPTS_DIR.exists():
+        PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
+        return prompts
+
+    private_dir = PROMPTS_DIR / "private"
+    files = [(f, "") for f in sorted(PROMPTS_DIR.glob("*.md"))]
+    if private_dir.is_dir():
+        files += [(f, "Private: ") for f in sorted(private_dir.glob("*.md"))]
+
+    for md_file, prefix in files:
+        try:
+            text = md_file.read_text(encoding="utf-8").strip()
+        except Exception:
+            continue
+
+        if not text:
+            continue
+
+        title = md_file.stem.replace("_", " ").title()
+        content = text
+
+        match = re.match(r"^---\s*\n(.*?)\n---\s*\n(.*)$", text, re.DOTALL)
+        if match:
+            try:
+                import yaml
+                meta = yaml.safe_load(match.group(1))
+                if isinstance(meta, dict):
+                    title = meta.get("title", title)
+                content = match.group(2).strip()
+            except Exception:
+                content = text
+
+        if content:
+            prompts[prefix + title] = content
+
+    return prompts
+
+
+SYSTEM_PROMPTS = load_system_prompts()
+
+# ---------------------------------------------------------------------------
+# Model folder scanner â€” replaces static gguf_models.json catalog
+# ---------------------------------------------------------------------------
+
+# LLM model folder: ComfyUI/models/LLM
+# Scans recursively for .gguf files, auto-detects mmproj companions.
+# mmproj detection: any .gguf file in the same folder whose name contains "mmproj".
+
+def _get_llm_folders() -> list[Path]:
+    """Return all registered LLM folders from ComfyUI folder_paths.
+
+    Covers multiple registered paths (e.g. two installs pointing to different drives)
+    and falls back to models/LLM if nothing is registered.
+    """
+    folders: list[Path] = []
+    try:
+        if hasattr(folder_paths, "get_folder_paths"):
+            for key in ("llm", "LLM", "llm_gguf", "LLM_gguf"):
+                for d in folder_paths.get_folder_paths(key):
+                    p = Path(d)
+                    if p not in folders:
+                        folders.append(p)
+    except Exception:
+        pass
+    if not folders:
+        folders.append(Path(folder_paths.models_dir) / "LLM")
+    return folders
+
+
+_LAST_SCAN_SIGNATURE: tuple | None = None
+
+
+# Architecture is read from the GGUF header rather than guessed from the file
+# name. Repackaged quants often carry no family name at all — e.g. the Qwen3.8
+# heretic ships as "RVN-Q5_K_M-multilingual.gguf", which used to miss every
+# adapter and fall through to the generic Qwen-VL chain. The name heuristics are
+# kept as a fallback for headers we cannot read.
+_GGUF_ARCH_CACHE: dict[str, str] = {}
+
+# GGUF scalar value types -> struct format char / byte width. 8 (string) and
+# 9 (array) are handled separately.
+_GGUF_FMT = {0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i",
+             6: "f", 7: "?", 10: "Q", 11: "q", 12: "d"}
+_GGUF_SIZE = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4,
+              6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+
+
+def _read_gguf_value(model_path, wanted_key: str):
+    """Return one metadata value from a GGUF header, or None if absent.
+
+    Reads only the metadata block (array values are skipped, not read) and stops
+    at the wanted key, so this costs little regardless of the model's size.
+    Raises on an unreadable header.
+    """
+    with open(model_path, "rb") as f:
+        if f.read(4) != b"GGUF":
+            raise ValueError("missing GGUF magic")
+        f.read(4)                                    # version
+        f.read(8)                                    # tensor count
+        n_kv = struct.unpack("<Q", f.read(8))[0]
+
+        def _read_str() -> str:
+            n = struct.unpack("<Q", f.read(8))[0]
+            return f.read(n).decode("utf-8", "replace")
+
+        for _ in range(n_kv):
+            key = _read_str()
+            vtype = struct.unpack("<I", f.read(4))[0]
+            if vtype == 8:
+                value = _read_str()
+            elif vtype == 9:
+                elem_type = struct.unpack("<I", f.read(4))[0]
+                length = struct.unpack("<Q", f.read(8))[0]
+                if elem_type == 8:
+                    # Skip each string by its own length prefix.
+                    for _ in range(length):
+                        f.seek(struct.unpack("<Q", f.read(8))[0], 1)
+                else:
+                    f.seek(_GGUF_SIZE[elem_type] * length, 1)
+                value = None
+            else:
+                value = struct.unpack(
+                    "<" + _GGUF_FMT[vtype], f.read(_GGUF_SIZE[vtype])
+                )[0]
+            if key == wanted_key:
+                return value
+    return None
+
+
+def _read_gguf_arch(model_path) -> str:
+    """Return general.architecture from a GGUF header, lowercased, or "".
+
+    Reads only the metadata block and stops at the architecture key, so this
+    costs a few KB regardless of how large the model file is.
+    """
+    cache_key = str(model_path)
+    if cache_key in _GGUF_ARCH_CACHE:
+        return _GGUF_ARCH_CACHE[cache_key]
+
+    arch = ""
+    try:
+        value = _read_gguf_value(model_path, "general.architecture")
+        if value is not None:
+            arch = str(value).strip().lower()
+    except Exception as e:
+        logger.warning("[Luna-LLMPrompt] Could not read architecture from %s: %s",
+                       model_path, e)
+
+    _GGUF_ARCH_CACHE[cache_key] = arch
+    return arch
+
+
+def _is_mtp_drafter(gguf_file: Path) -> bool:
+    """True for a stand-alone MTP drafter GGUF (not a model you can chat with)."""
+    name_lower = gguf_file.name.lower()
+    if name_lower.startswith("mtp-") or "mtp-only" in name_lower:
+        return True
+    return _read_gguf_arch(gguf_file).endswith("-assistant")
+
+
+def _scan_llm_folder() -> dict[str, dict]:
+    """Scan all registered LLM folders recursively and return a dict of display_name -> model info.
+
+    For each .gguf found that is NOT an mmproj file:
+      - display_name = "<top-level-folder>/<filename>" so ComfyUI groups models
+        into one collapsible folder per source (bare filename if in the LLM root)
+      - full_path    = absolute path to the model file
+      - mmproj_path  = absolute path to companion mmproj if found in same folder, else None
+
+    Files inside hidden / .cache directories are skipped.
+
+    mmproj detection rules (in order):
+      1. Any .gguf in the same folder whose name contains "mmproj" (case-insensitive)
+      2. If multiple mmproj files exist, prefer the one whose name most closely matches
+         the model file name (longest common prefix).
+    """
+    llm_folders = _get_llm_folders()
+    existing = [f for f in llm_folders if f.exists()]
+    if not existing:
+        print(f"[Luna-LLMPrompt] No LLM folders found. Checked: {[str(f) for f in llm_folders]}")
+        return {}
+
+    models: dict[str, dict] = {}
+    seen_names: set[str] = set()
+
+    # Walk all registered folders, keeping each file's root so we can derive its
+    # top-level subfolder for clean display grouping.
+    all_ggufs: list[tuple[Path, Path]] = []
+    for llm_folder in existing:
+        for gguf_file in sorted(llm_folder.rglob("*.gguf")):
+            all_ggufs.append((llm_folder, gguf_file))
+
+    for llm_root, gguf_file in all_ggufs:
+        name_lower = gguf_file.name.lower()
+
+        # Skip mmproj files â€” they are companions, not models
+        if "mmproj" in name_lower:
+            continue
+        # Skip MTP drafters (Gemma 4 "mtp-*.gguf", arch gemma4-assistant) — they
+        # are companions too. Qwen "...-mtp.gguf" files are full models and stay.
+        if _is_mtp_drafter(gguf_file):
+            continue
+
+        # Path relative to the LLM root. Skip anything inside hidden / .cache
+        # directories (HuggingFace download caches, etc.) so they don't pollute
+        # the dropdown.
+        try:
+            rel = gguf_file.relative_to(llm_root)
+        except ValueError:
+            rel = Path(gguf_file.name)
+        if any(part.startswith(".") for part in rel.parts):
+            continue
+
+        # Find mmproj companions in the same folder
+        folder = gguf_file.parent
+        mmproj_candidates = [
+            f for f in folder.glob("*.gguf")
+            if "mmproj" in f.name.lower()
+        ]
+
+        # Detect text-only models that should NOT be paired with mmproj.
+        # SuperGemma fine-tunes drop the vision encoder weights, so auto-pairing
+        # a Gemma 4 mmproj from the same folder causes the projector to load
+        # against mismatched weights and hang.
+        #
+        # Other uncensored Gemma 4 variants (e.g. "heretic" abliterated) DO
+        # support vision — only their refusal direction is removed. The
+        # discriminator is the "supergemma" name, not just "uncensored".
+        is_text_only = (
+            "supergemma" in name_lower
+            and "vision" not in name_lower
+        )
+
+        mmproj_path = None
+        if mmproj_candidates and not is_text_only:
+            if len(mmproj_candidates) == 1:
+                mmproj_path = mmproj_candidates[0]
+            else:
+                # Pick the one with the longest common prefix with the model filename
+                model_stem = gguf_file.stem.lower()
+                best = max(
+                    mmproj_candidates,
+                    key=lambda f: len(
+                        next(
+                            (model_stem[:i] for i in range(len(model_stem), 0, -1)
+                             if f.stem.lower().startswith(model_stem[:i])),
+                            ""
+                        )
+                    )
+                )
+                mmproj_path = best
+
+        # Build display name: group by the TOP-LEVEL subfolder under the LLM root
+        # so ComfyUI renders one clean, collapsible folder per source. Deep HF
+        # nesting (e.g. mradermacher/Repo-GGUF/model.gguf) collapses to the top
+        # folder (mradermacher/model.gguf). Files directly in the LLM root show
+        # as a bare filename.
+        if len(rel.parts) > 1:
+            top = rel.parts[0]
+            display = f"{top}/{gguf_file.name}"
+        else:
+            top = ""
+            display = gguf_file.name
+        # Rare collision (same filename within the same top folder): also fold in
+        # the immediate parent dir to keep the key unique.
+        if display in seen_names:
+            disamb = f"{gguf_file.parent.name}/{gguf_file.name}"
+            display = f"{top}/{disamb}" if top else disamb
+        seen_names.add(display)
+
+        models[display] = {
+            "full_path": str(gguf_file),
+            "mmproj_path": str(mmproj_path) if mmproj_path else None,
+        }
+
+    # ComfyUI calls INPUT_TYPES multiple times per graph validation, so the scan
+    # runs repeatedly. Only print when the result set actually changes — avoids
+    # spamming "Found N model(s)" five times per workflow run.
+    global _LAST_SCAN_SIGNATURE
+    signature = (len(models), tuple(sorted(models.keys())), tuple(str(f) for f in existing))
+    if signature != _LAST_SCAN_SIGNATURE:
+        _LAST_SCAN_SIGNATURE = signature
+        if models:
+            print(f"[Luna-LLMPrompt] Found {len(models)} model(s) across {len(existing)} LLM folder(s): {[str(f) for f in existing]}")
+        else:
+            print(f"[Luna-LLMPrompt] No GGUF models found. Scanned: {[str(f) for f in existing]}")
+
+    return models
+
+
+# Scanned at startup â€” refreshed on each INPUT_TYPES call so new models appear
+# without restarting ComfyUI.
+_SCANNED_MODELS: dict[str, dict] = {}
+
+
+def _refresh_model_list() -> dict[str, dict]:
+    global _SCANNED_MODELS
+    _SCANNED_MODELS = _scan_llm_folder()
+    return _SCANNED_MODELS
+
+
+_refresh_model_list()
+
+# ---------------------------------------------------------------------------
+# Helpers (same as QwenVL-Mod)
+# ---------------------------------------------------------------------------
+
+def _filter_kwargs_for_callable(fn, kwargs: dict) -> dict:
+    try:
+        sig = inspect.signature(fn)
+    except Exception:
+        return dict(kwargs)
+    params = list(sig.parameters.values())
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params):
+        return dict(kwargs)
+    allowed = {
+        p.name for p in params
+        if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    }
+    return {k: v for k, v in kwargs.items() if k in allowed}
+
+
+def _downscale_pil_to_mp(pil_img, max_mp: float):
+    """Shrink a PIL image to at most max_mp megapixels. 0 or less = unchanged.
+
+    Reference sheets and plates arrive at whatever size the loader produced;
+    encoding them at full size costs context and time for detail the vision
+    encoder discards anyway. Aspect ratio is preserved.
+    """
+    if not max_mp or max_mp <= 0:
+        return pil_img
+    w, h = pil_img.size
+    budget = max_mp * 1_000_000
+    area = w * h
+    if area <= budget:
+        return pil_img
+    scale = (budget / area) ** 0.5
+    return pil_img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+
+
+def _tensor_to_base64_png(tensor, max_mp: float = 0.0) -> str | None:
+    if tensor is None:
+        return None
+    if tensor.ndim == 4:
+        tensor = tensor[0]
+    array = (tensor * 255).clamp(0, 255).to(torch.uint8).cpu().numpy()
+    pil_img = _downscale_pil_to_mp(Image.fromarray(array, mode="RGB"), max_mp)
+    buf = BytesIO()
+    pil_img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+def _sample_video_frames(video, frame_count: int):
+    if video is None:
+        return []
+    if video.ndim != 4:
+        return [video]
+    total = int(video.shape[0])
+    frame_count = max(int(frame_count), 1)
+    if total <= frame_count:
+        return [video[i] for i in range(total)]
+    idx = np.linspace(0, total - 1, frame_count, dtype=int)
+    return [video[i] for i in idx]
+
+
+def _pick_device(device_choice: str) -> str:
+    if device_choice == "auto":
+        if torch.cuda.is_available():
+            return "cuda"
+        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            return "mps"
+        return "cpu"
+    if device_choice.startswith("cuda") and torch.cuda.is_available():
+        return "cuda"
+    if device_choice == "mps" and getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+# ---------------------------------------------------------------------------
+# Model resolution â€” from scanned folder list
+# ---------------------------------------------------------------------------
+
+def _resolve_model_paths(model_name: str) -> tuple[Path, Path | None]:
+    """Return (model_path, mmproj_path | None) for a display name from the scanned list."""
+    entry = _SCANNED_MODELS.get(model_name)
+    # Backward-compat: older workflows saved the bare filename (before the
+    # top-folder grouping). If the exact display key isn't found, fall back to
+    # matching by basename so those workflows still resolve.
+    if not entry:
+        base = model_name.split("/")[-1]
+        for disp, info in _SCANNED_MODELS.items():
+            if disp.split("/")[-1] == base or Path(info["full_path"]).name == base:
+                entry = info
+                break
+    if not entry:
+        raise FileNotFoundError(
+            f"[Luna-LLMPrompt] Model not found in scan: {model_name}. "
+            f"Check that the file exists in your LLM folder."
+        )
+    model_path = Path(entry["full_path"])
+    mmproj_path = Path(entry["mmproj_path"]) if entry.get("mmproj_path") else None
+    return model_path, mmproj_path
+
+
+def _resolve_model_settings(name_lower: str, thinking: bool = False) -> dict | None:
+    """Return the correct sampling settings for a known model family, or None.
+
+    Source of truth: the official LM Studio model.yaml recommendations
+    (hub/models/.../model.yaml -> config.operation.fields). Values target
+    NON-thinking prompt generation; thinking=True returns the family's
+    thinking-mode values where they differ (Qwen dense), for the quality levels
+    that turn thinking on.
+
+    This is applied SERVER-SIDE in generate() so the right values reach the
+    model regardless of the frontend JS preset's timing (which only fires on
+    manual dropdown clicks, not on workflow load / node creation / refresh).
+
+    Detection is by the model's display name (filename), which is reliable and
+    available before load — unlike self.loaded_model_name_lower which lags one
+    run behind on a model switch.
+    """
+    n = name_lower or ""
+
+    # Gemma 3 / 4 (all sizes incl. e2b/e4b/26b-a4b/31b):
+    #   YAML: temperature 1.0, top_k 64, top_p 0.95. No min_p / presence / rep.
+    if "gemma" in n:
+        return {
+            "temperature": 1.0, "top_p": 0.95, "top_k": 64,
+            "min_p": 0.0, "presence_penalty": 0.0, "repetition_penalty": 1.0,
+        }
+
+    # Qwen 3-VL / 2.5-VL (vision): these run through llama-cpp's vision handler,
+    # which does NOT reliably apply presence_penalty — so the aggressive Qwen
+    # text preset (min_p 0, presence 1.5) left nothing to stop repetition and
+    # abliterated VL builds spiralled into endless "no X, no Y" loops. Use a
+    # loop-resistant profile instead: a min_p floor plus a real repeat_penalty
+    # (the lever that actually works on the vision path), and no presence_penalty.
+    if "qwen" in n and "vl" in n:
+        return {
+            "temperature": 0.7, "top_p": 0.9, "top_k": 20,
+            "min_p": 0.05, "presence_penalty": 0.0, "repetition_penalty": 1.1,
+        }
+
+    # Qwen 3.6 MoE "a3b" variant: YAML uses a lower temperature (0.6).
+    if "qwen" in n and "a3b" in n:
+        return {
+            "temperature": 0.6, "top_p": 0.95, "top_k": 20,
+            "min_p": 0.0, "presence_penalty": 0.0, "repetition_penalty": 1.05,
+        }
+
+    # Qwen 3.0 / 3.5 / 3.6 (dense, text):
+    #   Official non-thinking values (Qwen3.6 model card, Unsloth) — temp 0.7,
+    #   top_p 0.8, top_k 20, min_p 0, presence_penalty 1.5, repetition_penalty
+    #   1.0. The extra repeat_penalty 1.05 this used to add, stacked on presence
+    #   1.5 over llama.cpp's 64-token penalty window, tipped long Krea prompts into
+    #   punctuation-less word salad; with 1.0 the same seed is clean (2026-10-10).
+    if "qwen" in n:
+        if thinking:
+            # Official thinking-mode values (Qwen3.5/3.6 model cards, Unsloth).
+            return {
+                "temperature": 1.0, "top_p": 0.95, "top_k": 20,
+                "min_p": 0.0, "presence_penalty": 1.5, "repetition_penalty": 1.0,
+            }
+        return {
+            "temperature": 0.7, "top_p": 0.8, "top_k": 20,
+            "min_p": 0.0, "presence_penalty": 1.5, "repetition_penalty": 1.0,
+        }
+
+    return None
+
+
+# Quality levels for the node's `quality` input. Each sets thinking, the
+# reasoning budget and MTP; "custom" leaves those widgets as they are. MTP is
+# skipped by _load_model on a GGUF without MTP heads or with a projector loaded,
+# so 3 is safe everywhere. Times measured on Qwen3.6 27B heretic-v2 with the
+# Krea General V1 preset (SPEC › 6, 2026-10-10): fast ~10 s, normal ~24 s,
+# ultra ~50 s; quality not measured.
+QUALITY_LEVELS = {
+    "fast":    {"thinking": False, "reasoning_budget": -1,   "mtp_draft_tokens": 3},
+    "normal":  {"thinking": True,  "reasoning_budget": 1024, "mtp_draft_tokens": 3},
+    "quality": {"thinking": True,  "reasoning_budget": 2048, "mtp_draft_tokens": 3},
+    "ultra":   {"thinking": True,  "reasoning_budget": -1,   "mtp_draft_tokens": 3},
+}
+QUALITY_OPTIONS = list(QUALITY_LEVELS) + ["custom"]
+
+
+def _looks_like_reasoning(text: str) -> bool:
+    """Detect if model output is reasoning/planning instead of a final prompt.
+
+    Catches: numbered lists, markdown bold headers, bullet analysis,
+    first-person planning, Qwen 3.5 raw thinking headers, and known
+    terminator artifacts.
+    """
+    if not text:
+        return False
+
+    # Qwen 3.5 raw thinking headers â€” emitted without <think> tags
+    # e.g. "Thinking Process:", "1. **Analyze the Inputs:**"
+    if re.search(r"(?im)^\s*thinking\s+process\s*:", text):
+        return True
+    if re.search(r"(?im)^\s*analysis\s*:", text):
+        return True
+    if re.search(r"(?im)^\s*draft\s+(construction|output)\s*:", text):
+        return True
+    if re.search(r"(?im)^\s*final\s+(review|check|polish|draft)\s*:", text):
+        return True
+    if re.search(r"(?im)^\s*internal\s+section", text):
+        return True
+
+    # Qwen 3.5 reasoning self-talk patterns
+    if re.search(r"(?im)^\s*\d+\.\s+\*{0,2}(analyze|deconstruct|draft|refine|merge|review|check|polish|verify)\b", text):
+        return True
+
+    # Known Qwen 3.5 thinking terminator artifact leaking through
+    # Appears as a bare "cw" or "cw\n" at the very end of output
+    if re.search(r"(?m)\bcw\s*$", text.strip()):
+        return True
+
+    # Standard planning first-person — "I should", "I need to", etc.
+    # "I will" alone is too broad (cinematic prose: "The camera will pan...")
+    # so require "I will" at a sentence boundary or line start.
+    if re.search(r"(?i)\b(i\s+(should|need\s+to|must|am\s+going\s+to|have\s+to))\b", text):
+        return True
+    # Reasoning self-correction openers — only strong planning words, not "first/next/then"
+    # (those appear constantly in cinematic prose: "First, the camera...", "Then the light...")
+    if re.search(r"(?im)^\s*(okay[,.:]|wait[,.:]|let me\b)", text):
+        return True
+
+    # Numbered analysis steps — only flag if the numbered items look like analysis tasks,
+    # not just any sentence starting with a number (scene lists, steps in a description).
+    # Pattern: "1. **Verb**" or "1. Verb the ..." where verb is an analysis word.
+    numbered = len(re.findall(
+        r"(?m)^\s*\d+\.\s+\*{0,2}(analyze|deconstruct|draft|refine|merge|review|check|polish|verify|assess|consider|plan)\b",
+        text, re.IGNORECASE
+    ))
+    if numbered >= 2:
+        return True
+
+    # Markdown bold headers that look like structured analysis sections
+    # e.g. "**Subject:**", "**Lighting:**", "**Camera:**" — three or more in a row
+    # Two bold headers alone is too sensitive (a prompt might legitimately bold two terms)
+    bold_headers = len(re.findall(r"(?m)\*{1,2}[A-Za-z][^*]+\*{1,2}\s*:", text))
+    if bold_headers >= 3:
+        return True
+
+    # Bullet point analysis — three or more bullets strongly suggests structured reasoning
+    bullets = len(re.findall(r"(?m)^\s*[-*]\s+", text))
+    if bullets >= 3:
+        return True
+
+    return False
+
+
+def _extract_reasoning(text: str) -> str:
+    """Return the reasoning the cleaner is about to throw away, or "".
+
+    The chat template pre-fills the opening tag into the PROMPT, so a thinking
+    response looks like "[reasoning]</think>[answer]" with no opening tag in the
+    output at all. Everything before the last closing delimiter is the model's
+    scratchpad. Gemma 4 uses <|channel>thought ... <channel|> instead of
+    <think>...</think>, so both are handled.
+    """
+    if not text:
+        return ""
+    for pat in (r"</think\s*>", r"<channel\|?>"):
+        if re.search(pat, text, flags=re.IGNORECASE):
+            head = re.split(pat, text, flags=re.IGNORECASE)[0]
+            head = re.sub(r"<think[^>]*>|<\|?channel>thought", "", head,
+                          flags=re.IGNORECASE)
+            return head.strip()
+    return ""
+
+
+def _strip_think_blocks(text: str) -> str:
+    """Strip thinking content from model output.
+
+    Mirrors VRGDG's approach: split on </think> and take whatever comes after.
+    Bulletproof against unclosed tags, malformed think blocks, and post-think
+    notes. Then peel off labeled draft markers like "Final Prompt:" if present.
+    """
+    cleaned = str(text or "")
+
+    # Split off a closed reasoning block FIRST. The template pre-fills the opening
+    # tag into the prompt, so a thinking reply is "[reasoning]</think>[answer]".
+    # The meta-commentary filters below run to end-of-text; on the reasoning
+    # ("1. **Analyze User Input:** ...") they used to delete the answer as well.
+    for _close in (r"</think\s*>", r"<channel\|?>"):
+        if re.search(_close, cleaned, flags=re.IGNORECASE):
+            cleaned = re.split(_close, cleaned, flags=re.IGNORECASE)[-1]
+
+    # Strip explicit reasoning headers at the start (some models emit them raw, no tags)
+    cleaned = re.sub(r"(?is)^\s*thinking process\s*:\s*", "", cleaned)
+    cleaned = re.sub(r"(?is)^\s*reasoning\s*:\s*", "", cleaned)
+    cleaned = re.sub(r"(?is)^\s*analysis\s*:\s*", "", cleaned)
+    cleaned = re.sub(r"(?is)^\s*\*+\s*thinking process\s*:?\s*\*+\s*", "", cleaned)
+    cleaned = re.sub(r"(?is)^\s*\*+\s*reasoning\s*:?\s*\*+\s*", "", cleaned)
+    cleaned = re.sub(r"(?is)^\s*\*+\s*analysis\s*:?\s*\*+\s*", "", cleaned)
+
+    # Strip leading single-char artifacts (",", ".", ";", "|") from chat template
+    # control tokens that decoded as a literal punctuation mark at output start.
+    # These leak from Qwen and Gemma chat templates on some GGUF builds.
+    cleaned = re.sub(r"^[,;.|]\s*", "", cleaned)
+
+    # Strip analytical meta-commentary that small models append. Pattern: a
+    # numbered bold header containing an analytical keyword (Analyze, Review,
+    # Check, Final, Format, Constraint, Verify, Polish, Refine), and everything
+    # after it. Examples we want to strip:
+    #   "4. **Final Review against Constraints:**\n  * Format: ..."
+    #   "1. **Analyze the Request:**\nUser Prompt: ..."
+    # The analytical keyword is the discriminator — natural prompt content very
+    # rarely uses numbered+bold+analytical-word formatting.
+    analytical_pattern = (
+        r"\d+\.\s+\*\*[^*\n]*"
+        r"(?:analyz|review|check|constraint|format|verify|polish|refine|final|breakdown|deconstruct)"
+        r"[^*\n]*\*\*.*$"
+    )
+    # Strip the analytical block when it follows a blank line (trailing meta)
+    cleaned = re.sub(
+        r"\n\s*\n\s*" + analytical_pattern,
+        "", cleaned, flags=re.IGNORECASE | re.DOTALL,
+    )
+    # Or when it starts at the very beginning of output (whole output is meta)
+    cleaned = re.sub(
+        r"^\s*" + analytical_pattern,
+        "", cleaned, flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    # The key trick: if </think> exists anywhere, take only what comes after it.
+    # Handles unclosed tags, nested tags, anything.
+    if re.search(r"</think>", cleaned, flags=re.IGNORECASE):
+        cleaned = re.split(r"</think>", cleaned, flags=re.IGNORECASE)[-1]
+    # Mop up any lingering <think>...</think> pairs and stray <think> openers
+    cleaned = re.sub(r"<think>.*?</think>", "", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    cleaned = re.sub(r"<think>", "", cleaned, flags=re.IGNORECASE)
+    cleaned = cleaned.strip()
+
+    # Gemma 4 uses a different thinking format: <|channel>thought\n...<channel|>
+    # Same trick — split on the closing marker, take what's after. Then handle
+    # tokenizer-decode artifacts: <|channel>thought sometimes decodes as ",se_thought"
+    # or similar garbled bytes when the special tokens aren't registered properly.
+    if re.search(r"<channel\|?>", cleaned, flags=re.IGNORECASE):
+        cleaned = re.split(r"<channel\|?>", cleaned, flags=re.IGNORECASE)[-1]
+    # Strip any leading thought-block opener that may have decoded as garbage bytes
+    # before "_thought" (e.g. ",se_thought", "_thought", "|>thought"). The underscore
+    # before "thought" is the discriminator — natural prose never has "_thought".
+    # Allow up to 20 chars of garbage before it, and don't require any separator after
+    # — the leaked output can be glued directly to the next word ("_thoughtbeautiful").
+    # The leading "_" before "thought" is the discriminator — natural prose never has
+    # "_thought" so this is safe to match without a word boundary, even when glued to
+    # the next word ("_thoughtbeautiful" → "beautiful").
+    cleaned = re.sub(r"^[^\n]{0,20}?_thought\s*\n?", "", cleaned, flags=re.IGNORECASE)
+    # Also catch bare "thought\n" at the very start (when garbage prefix got stripped earlier)
+    cleaned = re.sub(r"^thought\s*\n", "", cleaned, flags=re.IGNORECASE)
+    cleaned = cleaned.strip()
+
+    # If the model labels its final answer, extract just that part
+    labeled_patterns = [
+        r"(?is)(?:\*?\s*final prompt\s*:\*?)(.+)$",
+        r"(?is)(?:\*?\s*revised prompt\s*:\*?)(.+)$",
+        r"(?is)(?:\*?\s*final plan\s*:\*?)(.+)$",
+        r"(?is)(?:\*?\s*draft\s*:\*?)(.+)$",
+    ]
+    for pat in labeled_patterns:
+        m = re.search(pat, cleaned, flags=re.IGNORECASE)
+        if m:
+            candidate = m.group(1).strip()
+            if candidate:
+                cleaned = candidate
+                break
+
+    # Gemma 4 / SuperGemma control token artifacts
+    cleaned = re.sub(r"_?\s*<\|?channel\|?>\s*(?:thought|analysis|reasoning)?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"</?thought>", "", cleaned, flags=re.IGNORECASE)
+    # SuperGemma loop runaway tokens
+    for _marker in ("thought_turn", "turn_turn"):
+        if _marker in cleaned:
+            cleaned = cleaned.split(_marker)[0]
+    # SuperGemma language prefix artifacts
+    cleaned = re.sub(r"^나의 답변은 다음과 같습니다\.\s*", "", cleaned)
+    cleaned = re.sub(r"^回答[:：]\s*", "", cleaned)
+    cleaned = re.sub(r"^(?:Assistant|Answer):\s*", "", cleaned, flags=re.IGNORECASE)
+
+    return cleaned.strip()
+
+
+# ---------------------------------------------------------------------------
+# The Node â€” built on QwenVL-Mod's proven inference code
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Media encoding helpers (image / video / audio -> OpenAI-style content dicts)
+# ---------------------------------------------------------------------------
+
+ESTIMATED_TOKENS_PER_IMAGE = 258   # approx visual-token cost per frame
+MAX_VIDEO_FRAMES = 30
+MAX_AUDIO_DURATION_SECONDS = 60
+
+
+def _pil_to_content(pil, max_mp: float = 0.0) -> dict:
+    """A PIL image -> an OpenAI-compatible image_url dict (JPEG quality 95).
+
+    Converts to RGB first: JPEG has no alpha, and an RGBA PIL (browser PNGs
+    reaching luna_writer_api) would otherwise raise OSError on save.
+    """
+    pil = _downscale_pil_to_mp(pil.convert("RGB"), max_mp)
+    buf = BytesIO()
+    pil.save(buf, format="JPEG", quality=95)
+    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+
+
+def _image_tensor_to_content(image: torch.Tensor, max_mp: float = 0.0) -> dict:
+    """A single ComfyUI image tensor -> an OpenAI-compatible image_url dict.
+
+    Encodes JPEG quality 95 (much smaller base64 than PNG; the vision encoder
+    downsamples anyway, so lossless PNG just wastes context bytes + encode time).
+    Accepts [H,W,3] or [N,H,W,3] (first frame used for the 4-D case).
+    """
+    if image.ndim == 4:
+        image = image[0]
+    arr = (image.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+    return _pil_to_content(Image.fromarray(arr, mode="RGB"), max_mp)
+
+
+def _video_tensor_to_contents(video: torch.Tensor, target_fps: float = 1.0,
+                              source_fps: float = 30.0, n_ctx: int = 8192) -> list[dict]:
+    """A [F,H,W,3] video tensor -> list of image_url dicts, FPS-subsampled.
+
+    ComfyUI image batches carry no FPS metadata, so source_fps is assumed 30.
+    Frame count is derived from duration*target_fps, capped at MAX_VIDEO_FRAMES,
+    and further reduced if it would blow past ~70% of the context window
+    (each frame costs ~ESTIMATED_TOKENS_PER_IMAGE tokens).
+    """
+    total = int(video.shape[0])
+    if total == 0:
+        return []
+    duration = total / source_fps
+    count = min(max(1, int(duration * target_fps)), MAX_VIDEO_FRAMES, total)
+    estimated = count * ESTIMATED_TOKENS_PER_IMAGE
+    if estimated > n_ctx * 0.7:
+        old = count
+        count = max(1, min(old, int((n_ctx * 0.5) / ESTIMATED_TOKENS_PER_IMAGE)))
+        logger.warning("[Luna-LLMPrompt] Video frames reduced %d -> %d to fit context (%d tokens)",
+                       old, count, n_ctx)
+    idx = np.linspace(0, total - 1, count, dtype=int)
+    logger.info("[Luna-LLMPrompt] Video: %.1fs, %d frames total, sampling %d at %.1f fps",
+                duration, total, count, target_fps)
+    return [_image_tensor_to_content(video[i]) for i in idx]
+
+
+def _audio_to_content(audio: dict) -> dict:
+    """A ComfyUI AUDIO dict -> an OpenAI-compatible audio_url dict.
+
+    Resampled to 16 kHz mono WAV (the format the Gemma-4 audio projector wants).
+    Raises ValueError past MAX_AUDIO_DURATION_SECONDS. soundfile / torchaudio are
+    imported lazily so they are only required when audio is actually connected.
+    """
+    import soundfile as sf
+    import torchaudio
+
+    waveform = audio["waveform"]
+    sample_rate = int(audio["sample_rate"])
+    if waveform.ndim == 3:           # [B, C, T] -> [C, T]
+        waveform = waveform.squeeze(0)
+    if waveform.shape[0] > 1:        # mixdown to mono
+        waveform = waveform.mean(dim=0, keepdim=True)
+    if sample_rate != 16000:
+        waveform = torchaudio.transforms.Resample(sample_rate, 16000)(waveform)
+
+    duration = waveform.shape[-1] / 16000
+    if duration > MAX_AUDIO_DURATION_SECONDS:
+        raise ValueError(
+            f"Audio duration ({duration:.1f}s) exceeds the {MAX_AUDIO_DURATION_SECONDS}s "
+            "maximum. Trim the audio input."
+        )
+
+    audio_np = waveform.squeeze(0).cpu().numpy()
+    buf = BytesIO()
+    sf.write(buf, audio_np, 16000, format="WAV")
+    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return {"type": "audio_url", "audio_url": {"url": f"data:audio/wav;base64,{b64}"}}
+
+
+def _comfy_unload_caches() -> None:
+    """Ask ComfyUI's model manager to release VRAM so our unload cooperates with
+    the rest of the graph (mirrors the Duffy nodes' unload integration)."""
+    try:
+        import comfy.model_management as mm
+        mm.unload_all_models()
+        mm.soft_empty_cache()
+    except Exception as e:  # pragma: no cover - depends on ComfyUI runtime
+        logger.debug("[Luna-LLMPrompt] ComfyUI cache cleanup skipped: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Model-family adapters - encapsulate vision-handler choice + thinking control
+# ---------------------------------------------------------------------------
+# Each adapter answers, for its model family, "which llama-cpp vision handler
+# classes do I try, in order?". The per-handler constructor differences (which
+# thinking kwarg, whether image-token budgets / vision-id are accepted) live in
+# _build_vision_handler(), keyed on the handler class name - because those kwargs
+# are a property of the handler, not the family. The node stays generic and just
+# dispatches by model filename via pick_adapter(). This is the single-node
+# equivalent of the three separate Duffy nodes, minus the duplication and the
+# "wrong handler for wrong model" hazard.
+
+
+def _import_handler(name: str):
+    """Return a llama-cpp chat-handler class by name, or None if unavailable."""
+    try:
+        import llama_cpp.llama_chat_format as fmt
+        return getattr(fmt, name, None)
+    except Exception:
+        return None
+
+
+def _build_vision_handler(name: str, mmproj_path, disable_thinking: bool,
+                          preserve_thinking: bool, image_min_tokens: int,
+                          image_max_tokens: int):
+    """Construct one vision chat handler by class name with the right kwargs.
+
+    Returns the handler instance, or None if the class is missing or construction
+    fails (e.g. the latest Gemma-4 QAT mmproj that breaks Gemma4ChatHandler) so
+    the caller can fall through to the next candidate.
+    """
+    cls = _import_handler(name)
+    if cls is None:
+        return None
+
+    kwargs = {"clip_model_path": str(mmproj_path), "verbose": False}
+    if name == "Gemma4ChatHandler":
+        kwargs["enable_thinking"] = not disable_thinking
+    elif name == "Qwen35ChatHandler":
+        kwargs.update(
+            enable_thinking=not disable_thinking,
+            preserve_thinking=preserve_thinking,
+            add_vision_id=True,
+            image_min_tokens=image_min_tokens,
+            image_max_tokens=image_max_tokens,
+        )
+    elif name in ("Qwen3VLChatHandler", "Qwen25VLChatHandler"):
+        kwargs.update(
+            force_reasoning=not disable_thinking,
+            add_vision_id=True,
+            image_min_tokens=image_min_tokens,
+            image_max_tokens=image_max_tokens,
+        )
+    # Gemma3ChatHandler / Llava16ChatHandler take neither thinking nor image-token
+    # kwargs -> base kwargs only.
+
+    try:
+        return cls(**kwargs)
+    except Exception as e:
+        logger.warning("[Luna-LLMPrompt] %s construction failed: %s", name, e)
+        return None
+
+
+# MTP heads are only present when the GGUF still carries its NextN layers —
+# most requantized and fine-tuned uploads strip them. "<arch>.nextn_predict_layers"
+# > 0 is the marker llama.cpp itself loads them by.
+_GGUF_MTP_CACHE: dict[str, int] = {}
+
+
+def _reasoning_tags(arch: str):
+    """(start, end) thinking tags for a model family, or None when unknown.
+
+    Qwen 3.5 / 3.6 / 3.8 report arch "qwen35"/"qwen35moe" and think in
+    <think>...</think>; Gemma 4 thinks in <|channel>thought ... <channel|>.
+    """
+    if arch in Qwen35Adapter.ARCHES:
+        return "<think>", "</think>"
+    if arch.startswith("gemma4"):
+        return "<|channel>thought", "<channel|>"
+    return None
+
+
+def _gemma4_thinking_handler(llm):
+    """Chat handler for Gemma 4 text-only runs with thinking ON, or None.
+
+    Gemma 4's GGUF template thinks only when rendered with enable_thinking=true:
+    otherwise it puts an empty thought block after `<|turn>model`, which switches
+    thinking off. The wheel's create_chat_completion has no way to pass template
+    variables, so render the same template through our own formatter with the
+    flag bound in. Built the way the wheel builds its default template handler.
+    """
+    try:
+        from llama_cpp import llama_chat_format
+        template = llm.metadata.get("tokenizer.chat_template")
+        if not template:
+            return None
+
+        def _text(token_id):
+            return llm._model.token_get_text(token_id) if token_id != -1 else ""
+
+        formatter = llama_chat_format.Jinja2ChatFormatter(
+            template=template,
+            eos_token=_text(llm.token_eos()),
+            bos_token=_text(llm.token_bos()),
+            stop_token_ids=[t for t in (llm.token_eos(), llm.token_eot()) if t != -1],
+        )
+
+        def thinking_formatter(**kwargs):
+            kwargs["enable_thinking"] = True
+            return formatter(**kwargs)
+
+        return llama_chat_format.chat_formatter_to_chat_completion_handler(thinking_formatter)
+    except Exception as e:  # noqa: BLE001 - fall back to the default handler
+        logger.warning("[Luna-LLMPrompt] Gemma 4 thinking template could not be built: %s", e)
+        return None
+
+
+# Forced in front of the closing tag when the reasoning budget runs out, so the
+# model moves on to the answer instead of stopping mid-thought.
+_REASONING_BUDGET_MESSAGE = (
+    "\n\nConsidering the limited time, I will now write the final prompt "
+    "based on my thinking so far.\n"
+)
+
+
+def _gguf_mtp_layers(model_path, arch: str) -> int:
+    """Return the number of MTP (NextN) layers in a GGUF, 0 if none or unknown."""
+    cache_key = str(model_path)
+    if cache_key in _GGUF_MTP_CACHE:
+        return _GGUF_MTP_CACHE[cache_key]
+    layers = 0
+    if arch:
+        try:
+            value = _read_gguf_value(model_path, f"{arch}.nextn_predict_layers")
+            layers = int(value or 0)
+        except Exception as e:
+            logger.warning("[Luna-LLMPrompt] Could not read MTP layers from %s: %s",
+                           model_path, e)
+    _GGUF_MTP_CACHE[cache_key] = layers
+    return layers
+
+
+# Gemma 4 has no MTP heads of its own; Google ships separate "assistant"
+# drafters (mtp-gemma-4-*.gguf, arch gemma4-assistant). The pair must share the
+# embedding width: target <arch>.embedding_length == drafter
+# gemma4-assistant.embedding_length_out (12B 3840, 26B-A4B 2816, E4B 2560), which
+# also pairs fine-tunes (HauhauCS, Melody, SuperGemma) with Google's drafter.
+_DRAFTER_CACHE: dict[str, str | None] = {}
+
+# MEASURED 2026-10-11 (Gemma4 26B-A4B Q4_K_P, Krea preset, wheel 0.4.2): with the
+# drafter, swa_full must be on (off: 157 -> 86 tok/s); on costs VRAM that grows
+# with the context: 4k +0.6 GB (188 tok/s), 8k +1.4 GB (184), 16k +2.9 GB (180),
+# vs 157 tok/s without. Peter: drafter on at 8k or less.
+_DRAFTER_MAX_CTX = 8192
+
+
+def _find_mtp_drafter(model_path, arch: str) -> Path | None:
+    """Return the matching stand-alone MTP drafter GGUF for a Gemma 4 target, or None."""
+    if not arch.startswith("gemma4") or arch.endswith("-assistant"):
+        return None
+    key = str(model_path)
+    if key in _DRAFTER_CACHE:
+        found = _DRAFTER_CACHE[key]
+        return Path(found) if found else None
+    found = None
+    try:
+        width = int(_read_gguf_value(model_path, f"{arch}.embedding_length") or 0)
+        if width:
+            for folder in _get_llm_folders():
+                for f in sorted(Path(folder).rglob("*.gguf")):
+                    d_arch = _read_gguf_arch(f)
+                    if not d_arch.endswith("-assistant") or not d_arch.startswith(arch):
+                        continue
+                    if int(_read_gguf_value(f, f"{d_arch}.embedding_length_out") or 0) == width:
+                        found = str(f)
+                        break
+                if found:
+                    break
+    except Exception as e:
+        logger.warning("[Luna-LLMPrompt] Drafter lookup failed for %s: %s", model_path, e)
+    _DRAFTER_CACHE[key] = found
+    return Path(found) if found else None
+
+
+class ModelAdapter:
+    """Base adapter: generic Qwen-VL-style fallback chain, no audio."""
+    family = "generic"
+    supports_audio = False
+
+    @staticmethod
+    def matches(name_lower: str, arch: str = "") -> bool:
+        return False
+
+    def candidates(self, name_lower: str) -> list[str]:
+        return ["Qwen3VLChatHandler", "Qwen25VLChatHandler", "Llava16ChatHandler"]
+
+
+class GemmaAdapter(ModelAdapter):
+    family = "gemma"
+    supports_audio = True   # Gemma-4 mmproj can carry an audio projector
+
+    @staticmethod
+    def matches(name_lower: str, arch: str = "") -> bool:
+        # supergemma reports arch "gemma4" but is deliberately kept OFF this
+        # adapter, so the exclusion has to be checked before the arch shortcut —
+        # otherwise routing by architecture would silently re-include it.
+        if "supergemma" in name_lower:
+            return False
+        if arch.startswith("gemma"):
+            return True
+        return "gemma" in name_lower
+
+    def candidates(self, name_lower: str) -> list[str]:
+        # Gemma-3 has no Gemma4 handler; newer / unspecified Gemma -> try Gemma4
+        # first, then fall back to Gemma3 (covers the QAT-mmproj breakage you hit).
+        if "gemma-3" in name_lower or "gemma3" in name_lower or "gemma_3" in name_lower:
+            return ["Gemma3ChatHandler", "Llava16ChatHandler"]
+        return ["Gemma4ChatHandler", "Gemma3ChatHandler", "Llava16ChatHandler"]
+
+
+class Qwen35Adapter(ModelAdapter):
+    family = "qwen35"
+
+    # Qwen 3.5 / 3.6 / 3.8 all report themselves as "qwen35" in the GGUF header.
+    ARCHES = ("qwen35", "qwen35moe")
+
+    @staticmethod
+    def matches(name_lower: str, arch: str = "") -> bool:
+        if arch in Qwen35Adapter.ARCHES:
+            return True
+        return "qwen" in name_lower and any(
+            t in name_lower for t in
+            ("qwen3.5", "qwen3-5", "qwen35", "qwen3.6", "qwen3-6", "qwen36")
+        )
+
+    def candidates(self, name_lower: str) -> list[str]:
+        return ["Qwen35ChatHandler", "Qwen3VLChatHandler",
+                "Qwen25VLChatHandler", "Llava16ChatHandler"]
+
+
+class Qwen3VLAdapter(ModelAdapter):
+    family = "qwen3vl"
+
+    ARCHES = ("qwen3vl", "qwen3vlmoe")
+
+    @staticmethod
+    def matches(name_lower: str, arch: str = "") -> bool:
+        if arch in Qwen3VLAdapter.ARCHES:
+            return True
+        return "qwen" in name_lower and "vl" in name_lower
+
+    def candidates(self, name_lower: str) -> list[str]:
+        return ["Qwen3VLChatHandler", "Qwen25VLChatHandler", "Llava16ChatHandler"]
+
+
+# Order matters: most specific families first. Qwen 3.5/3.6 must win over the
+# generic Qwen-VL matcher so a "qwen3.5-vl" model gets Qwen35ChatHandler.
+_ADAPTERS: list[ModelAdapter] = [
+    GemmaAdapter(),
+    Qwen35Adapter(),
+    Qwen3VLAdapter(),
+]
+
+
+def pick_adapter(name_lower: str, arch: str = "") -> ModelAdapter:
+    for adapter in _ADAPTERS:
+        if adapter.matches(name_lower, arch):
+            return adapter
+    return ModelAdapter()
+
+
+# ---------------------------------------------------------------------------
+# Inference runner - holds the loaded model (module-level state, since the V3
+# node below is stateless / classmethod-based and cannot keep state on self).
+# ---------------------------------------------------------------------------
+
+class _LLMRunner:
+    """Prompt generation runner using local GGUF VL models.
+
+    Holds the cached llama-cpp model + chat handler between executions. The V3
+    LLMPromptNode delegates to a single module-level instance of this class.
+    """
+
+    def __init__(self):
+        self.llm = None
+        self.chat_handler = None
+        self.current_signature = None
+        self.loaded_model_name_lower = ""
+        # GGUF general.architecture of the loaded model. Repackaged quants carry
+        # no family name in the filename, so the thinking controls below must key
+        # off this rather than the name.
+        self.loaded_model_arch = ""
+        self.last_reasoning = ""
+        # Set per-run from the verbose_logging widget. Gates the chatty status
+        # prints (handler choice, load lines, token/speed); warnings and errors
+        # are always printed regardless.
+        self._verbose = False
+
+    def _vprint(self, msg: str) -> None:
+        """Print only when verbose_logging is on. Use for routine status lines."""
+        if self._verbose:
+            print(msg)
+
+    # ------------------------------------------------------------------
+    # VRAM cleanup (same as QwenVL-Mod)
+    # ------------------------------------------------------------------
+
+    def clear(self):
+        if self.chat_handler is not None:
+            try:
+                if hasattr(self.chat_handler, 'close'):
+                    self.chat_handler.close()
+                elif hasattr(self.chat_handler, '__del__'):
+                    self.chat_handler.__del__()
+            except Exception:
+                pass
+            self.chat_handler = None
+
+        if self.llm is not None:
+            try:
+                if hasattr(self.llm, 'close'):
+                    self.llm.close()
+                del self.llm
+            except Exception:
+                pass
+            self.llm = None
+
+        self.current_signature = None
+        self.loaded_model_name_lower = ""
+        self.loaded_model_arch = ""
+        gc.collect()
+
+        # Let ComfyUI's model manager release its own VRAM too, so unloading here
+        # cooperates with the rest of the graph instead of fighting it.
+        _comfy_unload_caches()
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+
+    # ------------------------------------------------------------------
+    # Model loading (same as QwenVL-Mod GGUF)
+    # ------------------------------------------------------------------
+
+    def _load_model(self, model_name: str, device: str, n_ctx: int = 8192, n_gpu_layers: int = -1,
+                    disable_thinking: bool = True, want_vision: bool = True,
+                    preserve_thinking: bool = False, image_min_tokens: int = 1024,
+                    image_max_tokens: int = 4096, load_mmproj: str = "auto",
+                    mtp_draft_tokens: int = 0):
+        # Resolve paths directly from the scanned folder list â€” no JSON catalog needed
+        model_path, mmproj_path = _resolve_model_paths(model_name)
+
+        if not model_path.exists():
+            raise FileNotFoundError(f"[Luna-LLMPrompt] Model file missing: {model_path}")
+        if mmproj_path and not mmproj_path.exists():
+            print(f"[Luna-LLMPrompt] Warning: mmproj not found at {mmproj_path}, running text-only.")
+            mmproj_path = None
+
+        m_name_lower_sig = model_path.name.lower()
+        model_arch = _read_gguf_arch(model_path)
+        is_vl = "vl" in m_name_lower_sig or model_arch in Qwen3VLAdapter.ARCHES
+        # The no-think template targets NON-VL Qwen 3.5/3.6 (Qwen35ChatHandler
+        # does not suppress thinking). VL models are EXCLUDED: their vision
+        # handler (Qwen3VLChatHandler / Qwen25VLChatHandler) applies
+        # force_reasoning=False, which already disables thinking and makes them
+        # work well — so we never strip their handler or touch their template.
+        is_qwen_35_36 = (
+            model_arch in Qwen35Adapter.ARCHES
+            or bool(re.search(r"qwen3\.?5|qwen3-5|qwen35|qwen3\.?6|qwen3-6|qwen36",
+                              m_name_lower_sig))
+        ) and not is_vl
+
+        # Whether to pair the model with its projector at all.
+        #
+        # "auto" (default) drops it whenever no media is connected. Carrying a
+        # projector on a text-only run is not free: the vision handler reserves
+        # image_min_tokens of context per generation on top of the prompt, and it
+        # costs ~0.6-1.1 GB of VRAM. Dropping it also lets Qwen's no-think
+        # template engage.
+        #
+        # VL models are always exempt - they keep their handler even with no
+        # image connected (that is how Qwen-VL works fast and without thinking).
+        #
+        # "always" pins the projector so bypassing an image node does not change
+        # the load signature and force a full model reload. "never" is text-only
+        # regardless, for maximum context headroom on a tight card.
+        if mmproj_path is not None and not is_vl:
+            if load_mmproj == "never":
+                self._vprint("[Luna-LLMPrompt] load_mmproj=never - loading text-only.")
+                mmproj_path = None
+            elif load_mmproj == "auto" and not want_vision:
+                self._vprint("[Luna-LLMPrompt] No media connected - loading text-only "
+                             "(frees VRAM, no reserved image-token budget).")
+                mmproj_path = None
+
+        device_kind = _pick_device(device)
+        # CPU always 0; on GPU use the user-supplied value (-1 = all layers, N = partial offload)
+        effective_gpu_layers = 0 if device_kind == "cpu" else n_gpu_layers
+        has_mmproj = mmproj_path is not None
+
+        use_qwen_no_think = disable_thinking and not has_mmproj and is_qwen_35_36
+
+        # MTP speculative decoding: the model's own NextN heads draft tokens that
+        # the full model then verifies, so the output is unchanged — only faster.
+        # Text-only in llama.cpp, so any loaded projector turns it off.
+        # Gemma 4 has no heads of its own and uses a separate drafter GGUF
+        # (_find_mtp_drafter) with the wheel author's tested settings (2 draft
+        # tokens, backend sampling) and swa_full, only up to _DRAFTER_MAX_CTX.
+        # On 0.3.49 without draft_backend_sampling the drafter read prompts ~50x
+        # slower and crashed with swa_full=False (SPEC › 6, 2026-10-10 / -11).
+        mtp_draft = 0
+        mtp_note = ""
+        drafter = None
+        if mtp_draft_tokens > 0:
+            if SpecConfig is None:
+                mtp_note = "MTP skipped: this llama-cpp-python wheel has no MTP (needs 0.3.48+)."
+            elif has_mmproj:
+                mtp_note = "MTP skipped: a vision projector is loaded (MTP is text-only)."
+            elif _gguf_mtp_layers(model_path, model_arch) > 0:
+                mtp_draft = int(mtp_draft_tokens)
+                mtp_note = f"MTP on: {mtp_draft} draft tokens."
+            elif (found := _find_mtp_drafter(model_path, model_arch)) is None:
+                mtp_note = "MTP skipped: this GGUF has no MTP heads (use an MTP build of the model)."
+            elif n_ctx > _DRAFTER_MAX_CTX:
+                mtp_note = (f"MTP skipped: the drafter {found.name} needs a context of "
+                            f"{_DRAFTER_MAX_CTX} or less (it costs VRAM that grows with the context).")
+            else:
+                drafter = found
+                mtp_draft = 2
+                mtp_note = f"MTP on: drafter {drafter.name}, 2 draft tokens."
+
+        signature = {
+            "model_path": str(model_path),
+            "mmproj_path": str(mmproj_path) if has_mmproj else "",
+            "n_gpu_layers": effective_gpu_layers,
+            "n_ctx": n_ctx,
+            "device_kind": device_kind,
+            "want_vision": bool(want_vision and mmproj_path is not None),
+            # Changing the no-think template requires a reload, so it's part of
+            # the load signature.
+            "qwen_no_think": use_qwen_no_think,
+            # Thinking + image-token budgets are now baked into the vision chat
+            # handler at construction time, so changing any of them must reload.
+            "disable_thinking": bool(disable_thinking),
+            "preserve_thinking": bool(preserve_thinking),
+            "image_min_tokens": int(image_min_tokens),
+            "image_max_tokens": int(image_max_tokens),
+            "mtp_draft": mtp_draft,
+            "mtp_drafter": str(drafter) if drafter else "",
+        }
+        if self.llm is not None and self.current_signature == signature:
+            return
+
+        self.clear()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            time.sleep(0.1)
+
+        if mtp_note:
+            print(f"[Luna-LLMPrompt] {mtp_note}")
+
+        # Load vision handler â€” handler selection order matches JamePeng 0.3.39 API
+        # Load the vision handler via the family adapter. The adapter supplies an
+        # ordered list of candidate handler classes; we build the first one that
+        # succeeds. This replaces the old inline if/elif chain and adds:
+        #   - Gemma4ChatHandler, with graceful fallback to Gemma3 for the QAT
+        #     mmproj builds that break it,
+        #   - handler-level thinking control (enable_thinking / force_reasoning),
+        #   - user-controlled image_min/max_tokens.
+        self.chat_handler = None
+        if has_mmproj:
+            adapter = pick_adapter(model_path.name.lower(), model_arch)
+            for cand in adapter.candidates(model_path.name.lower()):
+                handler = _build_vision_handler(
+                    cand, mmproj_path, disable_thinking, preserve_thinking,
+                    image_min_tokens, image_max_tokens,
+                )
+                if handler is not None:
+                    self.chat_handler = handler
+                    self._vprint(
+                        f"[Luna-LLMPrompt] Vision handler: {cand} (family={adapter.family}, "
+                        f"thinking={'on' if not disable_thinking else 'off'}, "
+                        f"img_tokens={image_min_tokens}-{image_max_tokens})"
+                    )
+                    break
+
+            if self.chat_handler is None:
+                # Every candidate failed (missing handler classes, or the latest
+                # Gemma-4 QAT mmproj that breaks Gemma4ChatHandler). Fall back to
+                # text-only rather than hard-failing, so the node still produces a
+                # prompt from the text inputs.
+                print(
+                    "[Luna-LLMPrompt] Warning: no vision handler could be built for "
+                    f"{model_path.name}; running text-only (images will be ignored)."
+                )
+                has_mmproj = False
+
+        # Load LLM
+        llm_kwargs = {
+            "model_path": str(model_path),
+            "n_ctx": n_ctx,
+            "n_gpu_layers": effective_gpu_layers,
+            "n_batch": 512,
+            # swa_full=True forces a full-size SWA cache. It enables cross-run
+            # prompt caching at significant VRAM cost. We do one-shot inference
+            # per run and never reuse the cache — so this just wastes VRAM and
+            # causes 26B Gemma models to thrash. Default (False) is much lighter.
+            # ref: https://github.com/ggml-org/llama.cpp/pull/13194
+            "swa_full": False,
+            "verbose": False,
+            "pool_size": 4194304,
+            "top_k": 0,
+            "flash_attn": True,
+            # Hybrid models (Qwen 3.5/3.6): JamePeng 0.3.49 saves a state
+            # checkpoint after the prompt and after every run. On the host that
+            # is a ~2 s VRAM-to-RAM copy per call, which halved the node's speed
+            # (20-24 vs 47 tok/s); on the device it costs nothing measurable.
+            # Kept rather than disabled: MTP rollback uses the checkpoints.
+            "checkpoint_on_device": True,
+            # chat_template_kwargs does NOT belong here â€” no effect on Llama.__init__.
+            # Passed at inference time via create_chat_completion instead.
+        }
+        if mtp_draft and drafter is not None:
+            # External drafter, settings from the wheel's README for
+            # gemma4 + gemma4-assistant; swa_full is required for its speed.
+            llm_kwargs["speculative"] = SpecConfig(
+                spec_type=SpeculativeType.DRAFT_MTP,
+                draft_model_path=str(drafter),
+                draft_n_max=mtp_draft,
+                draft_p_min=0.0,
+                draft_n_gpu_layers=0 if device_kind == "cpu" else "all",
+                draft_backend_sampling=True,
+            )
+            llm_kwargs["swa_full"] = True
+        elif mtp_draft:
+            # Uses the target GGUF's own NextN heads (no draft_model_path).
+            # draft_p_min 0.0 follows the JamePeng / llama.cpp MTP examples.
+            llm_kwargs["speculative"] = SpecConfig(
+                spec_type=SpeculativeType.DRAFT_MTP,
+                draft_n_max=mtp_draft,
+                draft_p_min=0.0,
+            )
+        if has_mmproj and self.chat_handler is not None:
+            # image_min/max_tokens belong on the chat handler, not here.
+            llm_kwargs["chat_handler"] = self.chat_handler
+        else:
+            # Text-only path: set chat_format only for models whose GGUF does NOT embed a
+            # usable Jinja2 template, or where the embedded template needs overriding.
+            #
+            # Qwen 3.5 and Qwen 3.6: DO NOT set chat_format â€” let llama.cpp use the
+            # embedded GGUF template. That is the only path where enable_thinking=False
+            # (passed at inference time) is actually processed correctly.
+            #
+            # Gemma 3/4: embedded template works, but "gemma3" format is still needed
+            # because older GGUF builds may not embed it.
+            m_name_lower = model_path.name.lower()
+            if model_arch.startswith("gemma4") and not disable_thinking:
+                # Thinking ON: the fixed "gemma3" format has no thinking switch,
+                # so Gemma 4 never thought on text-only runs. The embedded GGUF
+                # template does (it is what LM Studio uses).
+                self._vprint("[Luna-LLMPrompt] Gemma 4 + thinking: using the embedded GGUF template.")
+            elif "gemma" in m_name_lower:
+                # Try "gemma3" first (newer llama-cpp-python). If unavailable, DO
+                # NOT fall back to the legacy "gemma" handler — it is the Gemma 1/2
+                # template and is incompatible with Gemma 4's <|channel> / channel
+                # thought-block tokens. The model would produce garbage output
+                # like ",[]" because the chat structure is wrong.
+                #
+                # Instead, leave chat_format unset so llama-cpp-python uses the
+                # GGUF's embedded Jinja2 template — which is correct for Gemma 4
+                # GGUFs built after Google's April 11 chat template fix.
+                try:
+                    from llama_cpp.llama_chat_format import _CHAT_HANDLERS  # type: ignore
+                    if "gemma3" in _CHAT_HANDLERS:
+                        llm_kwargs["chat_format"] = "gemma3"
+                    # else: no override — embedded GGUF template
+                except Exception:
+                    pass  # no override — embedded GGUF template
+            elif "llama-3" in m_name_lower:
+                llm_kwargs["chat_format"] = "llama-3"
+            elif "qwen" in m_name_lower:
+                # Qwen text-only. When disable_thinking is on, install our custom
+                # no-think ChatML template (pre-fills an empty <think></think>),
+                # which forces thinking off regardless of what the embedded
+                # template does or whether chat_template_kwargs is supported.
+                # This replicates the manual LM Studio template edit that works
+                # reliably. Fail-safe: any error falls back to the embedded
+                # template (current behavior).
+                if use_qwen_no_think:
+                    try:
+                        from llama_cpp.llama_chat_format import Jinja2ChatFormatter
+                        formatter = Jinja2ChatFormatter(
+                            template=_QWEN_NO_THINK_CHATML,
+                            eos_token="<|im_end|>",
+                            bos_token="",
+                        )
+                        self.chat_handler = formatter.to_chat_handler()
+                        llm_kwargs["chat_handler"] = self.chat_handler
+                        self._vprint("[Luna-LLMPrompt] Qwen: using custom NO-THINK ChatML template (thinking hard-disabled).")
+                    except Exception as e:
+                        print(
+                            f"[Luna-LLMPrompt] Could not install no-think template ({e}); "
+                            "falling back to embedded template + enable_thinking flag."
+                        )
+                # else: embedded template (thinking allowed, or controlled via kwargs)
+
+        self._vprint(
+            f"[Luna-LLMPrompt] Loading: {model_path.name} "
+            f"(device={device_kind}, gpu_layers={effective_gpu_layers}, ctx={n_ctx})"
+        )
+
+        if Llama is None:
+            raise RuntimeError(
+                "llama-cpp-python is not available, so the local GGUF node cannot load a "
+                f"model. Original import error: {_LLAMA_IMPORT_ERROR}. Reinstall a working "
+                "llama-cpp-python wheel (the cloud API node works without it)."
+            )
+
+        llm_kwargs_filtered = _filter_kwargs_for_callable(
+            getattr(Llama, "__init__", Llama), llm_kwargs
+        )
+
+        if has_mmproj and self.chat_handler and "chat_handler" not in llm_kwargs_filtered:
+            print("[Luna-LLMPrompt] Warning: Llama() doesn't accept chat_handler. Images will be ignored.")
+
+        try:
+            self.llm = Llama(**llm_kwargs_filtered)
+        except Exception as e:
+            if drafter is None:
+                raise
+            # A drafter that does not fit this target must not cost the run:
+            # load without it.
+            print(f"[Luna-LLMPrompt] MTP drafter {drafter.name} failed to load ({e}); loading without it.")
+            _DRAFTER_CACHE[str(model_path)] = None   # not again for this model this session
+            llm_kwargs_filtered.pop("speculative", None)
+            llm_kwargs_filtered["swa_full"] = False
+            signature["mtp_draft"], signature["mtp_drafter"] = 0, ""
+            self.llm = Llama(**llm_kwargs_filtered)
+        if model_arch.startswith("gemma4") and not disable_thinking and not has_mmproj:
+            handler = _gemma4_thinking_handler(self.llm)
+            if handler is not None:
+                # On the Llama only: self.chat_handler stays None, which is what
+                # marks this as a text-only load elsewhere.
+                self.llm.chat_handler = handler
+                self._vprint("[Luna-LLMPrompt] Gemma 4 + thinking: embedded template with enable_thinking=true.")
+        self.current_signature = signature
+        self.loaded_model_name_lower = model_path.name.lower()
+        self.loaded_model_arch = model_arch
+        self._vprint(f"[Luna-LLMPrompt] Model loaded: {model_path.name}")
+
+    # ------------------------------------------------------------------
+    # Inference (same create_chat_completion as QwenVL-Mod)
+    # ------------------------------------------------------------------
+
+    def _invoke(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        media_content: list[dict],
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        repetition_penalty: float,
+        seed: int,
+        top_k: int = 30,
+        min_p: float = 0.05,
+        disable_thinking: bool = True,
+        presence_penalty: float = 0.0,
+        frequency_penalty: float = 0.0,
+        reasoning_budget: int = -1,
+    ) -> str:
+        """Run inference.
+
+        media_content is a pre-built list of OpenAI-style content dicts
+        (image_url / audio_url), already ordered and labelled by the caller, or
+        an empty list for text-only inference.
+        """
+        if media_content and self.chat_handler is not None:
+            content = [{"type": "text", "text": user_prompt}] + list(media_content)
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": content},
+            ]
+        else:
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ]
+
+        start = time.perf_counter()
+        completion_kwargs = {
+            "messages": messages,
+            "max_tokens": int(max_tokens),
+            "temperature": float(temperature),
+            "top_p": float(top_p),
+            "top_k": int(top_k),
+            "min_p": float(min_p),
+            "repeat_penalty": float(repetition_penalty),
+            "seed": int(seed),
+        }
+        # presence_penalty is the key Qwen non-thinking setting (Unsloth: 1.5)
+        # to stop repetition/looping. Only send when non-zero so we don't
+        # disturb models that don't want it.
+        if abs(float(presence_penalty)) > 1e-6:
+            completion_kwargs["presence_penalty"] = float(presence_penalty)
+        # frequency_penalty: only send when set, same reasoning as presence_penalty.
+        if abs(float(frequency_penalty)) > 1e-6:
+            completion_kwargs["frequency_penalty"] = float(frequency_penalty)
+        # Thinking-mode kill switch via chat template. The /no_think control
+        # token in the user prompt only works on some Qwen GGUF builds — passing
+        # enable_thinking=False at the chat-template level is more reliable
+        # because it bypasses the model's training entirely and renders the chat
+        # template WITHOUT the thinking infrastructure.
+        # (Approach borrowed from lihaoyun6/ComfyUI-llama-cpp_vlm.)
+        #
+        # Applies to Qwen 3/3.5/3.6 AND Gemma 4 — both expose an `enable_thinking`
+        # Jinja variable (confirmed via LM Studio model.yaml customFields). When
+        # the active path uses a hardcoded chat_format handler instead of the
+        # embedded Jinja template (e.g. Gemma with chat_format="gemma3"), the
+        # kwarg is simply ignored — harmless. Stray thinking is still stripped
+        # from the output by _strip_think_blocks() as the safety net.
+        name_lower = self.loaded_model_name_lower or ""
+        arch = self.loaded_model_arch or ""
+        # Arch first: repackaged quants (e.g. "RVN-Q5_K_M-multilingual.gguf") have
+        # no family name to match on, and their embedded template defaults to
+        # thinking ON — so a name-only check silently leaves reasoning enabled.
+        is_thinking_family = (
+            arch in Qwen35Adapter.ARCHES
+            or arch.startswith("gemma")
+            or "qwen" in name_lower
+            or "gemma" in name_lower
+        )
+        if disable_thinking and is_thinking_family:
+            completion_kwargs["chat_template_kwargs"] = {"enable_thinking": False}
+
+        # Reasoning budget (llama.cpp --reasoning-budget): once the reasoning block
+        # reaches N tokens the sampler forces the message + closing tag, and the
+        # model writes the answer. Only for families whose thinking tags are known;
+        # on a model that does not think, a forced closing tag would cut the answer.
+        if not disable_thinking and int(reasoning_budget) >= 0:
+            tags = _reasoning_tags(arch)
+            if tags is None:
+                self._vprint(f"[Luna-LLMPrompt] reasoning_budget ignored: no known thinking tags for arch '{arch}'.")
+            else:
+                start_tag, end_tag = tags
+                completion_kwargs.update(
+                    reasoning_budget=int(reasoning_budget),
+                    reasoning_start=start_tag,
+                    reasoning_end=end_tag,
+                    reasoning_budget_message=_REASONING_BUDGET_MESSAGE,
+                    # True also covers a template that does NOT pre-fill the tag:
+                    # counting then starts one tag early. False on a pre-filled
+                    # template would never see the tag and silently do nothing.
+                    reasoning_start_in_prompt=True,
+                )
+                # JamePeng 0.3.49: with min_p exactly 0.0 the forced message and
+                # closing tag come out as garbage ("''''/'") and the model keeps
+                # thinking. Any min_p > 0 works; 1e-6 changes nothing in practice.
+                if completion_kwargs["min_p"] <= 0.0:
+                    completion_kwargs["min_p"] = 1e-6
+
+        # The reasoning block counts toward max_tokens, so with thinking ON the
+        # default 2048 ran out inside the reasoning (Krea V1 thinks ~3,300 tokens)
+        # and left no answer. max_tokens stays the answer's length; the reasoning
+        # gets its own room on top: the budget, or the rest of the context when
+        # the budget is unlimited (-1 = up to n_ctx in llama-cpp-python).
+        if not disable_thinking:
+            if int(reasoning_budget) >= 0:
+                completion_kwargs["max_tokens"] = int(max_tokens) + int(reasoning_budget) + 128
+            else:
+                completion_kwargs["max_tokens"] = -1
+        max_tokens = completion_kwargs["max_tokens"]
+
+        completion_kwargs = _filter_kwargs_for_callable(
+            self.llm.create_chat_completion, completion_kwargs
+        )
+        # Gemma-family models lose their natural EOS (</s>) at load time because
+        # llama.cpp's EOG-list logic conflicts with <|tool_response>. Without an
+        # explicit stop list they generate until max_tokens. Add Gemma stops back.
+        # Qwen/other models keep llama.cpp's default EOS handling (no stop list).
+        if "gemma" in (self.loaded_model_name_lower or ""):
+            # SuperGemma uncensored fine-tunes emit "thought_turn" / "turn_turn"
+            # as literal text in runaway loops (the fine-tune broke clean EOS
+            # behavior). Add them as string stops so the model halts when those
+            # appear, before they consume max_tokens worth of garbage.
+            completion_kwargs["stop"] = [
+                "<end_of_turn>", "<eos>", "</s>",
+                "thought_turn", "turn_turn",
+            ]
+        result = self.llm.create_chat_completion(**completion_kwargs)
+        elapsed = max(time.perf_counter() - start, 1e-6)
+
+        usage = result.get("usage") or {}
+        prompt_tokens = usage.get("prompt_tokens")
+        completion_tokens = usage.get("completion_tokens")
+        finish_reason = (result.get("choices") or [{}])[0].get("finish_reason", "unknown")
+        # For the node face's last-run line (sent as `ui` data by execute()).
+        self.last_stats = {
+            "seconds": round(elapsed, 2),
+            "prompt_tokens": prompt_tokens if isinstance(prompt_tokens, int) else 0,
+            "completion_tokens": completion_tokens if isinstance(completion_tokens, int) else 0,
+            "tok_s": round(completion_tokens / elapsed, 1) if isinstance(completion_tokens, int) else 0.0,
+            "finish": str(finish_reason),
+            "thinking": not disable_thinking,
+            "mtp": int((self.current_signature or {}).get("mtp_draft", 0)),
+        }
+        if isinstance(completion_tokens, int) and completion_tokens > 0:
+            tok_s = completion_tokens / elapsed
+            self._vprint(
+                f"[Luna-LLMPrompt] Tokens: prompt={prompt_tokens}, "
+                f"completion={completion_tokens}, "
+                f"time={elapsed:.2f}s, speed={tok_s:.2f} tok/s, "
+                f"finish={finish_reason}"
+            )
+        if finish_reason == "length":
+            print(
+                f"[Luna-LLMPrompt] âš  Output TRUNCATED â€” hit max_tokens={max_tokens}. "
+                f"Increase max_tokens to get complete output."
+            )
+
+        raw = str((result.get("choices") or [{}])[0].get("message", {}).get("content", "") or "")
+        # Strip think blocks here, before any caller sees the output.
+        # This covers both JSON and text paths â€” no downstream path needs to handle it.
+        # Keep the reasoning so it can be surfaced on the log output instead of
+        # being silently discarded - with thinking on there was previously no
+        # way to see what the model actually planned.
+        self.last_reasoning = _extract_reasoning(raw)
+        stripped = _strip_think_blocks(raw)
+
+        # SALVAGE: aggressive uncensored fine-tunes (e.g. *-HauhauCS-Aggressive)
+        # routinely ignore enable_thinking AND /no_think, generating a huge
+        # reasoning block and then stopping â€” leaving NOTHING after </think>.
+        # _strip_think_blocks then returns empty -> "NO PROMPT OUTPUT".
+        # When that happens, try to recover the actual prompt draft buried in the
+        # reasoning blob instead of silently returning empty.
+        if not stripped.strip() and raw.strip():
+            salvaged = self._extract_draft_from_reasoning(raw)
+            if salvaged and salvaged.strip():
+                print("[Luna-LLMPrompt] Output was all reasoning â€” salvaged the prompt draft from it.")
+                return salvaged.strip()
+            print(
+                "[Luna-LLMPrompt] âš  Model produced ONLY reasoning, no usable prompt "
+                f"({len(raw)} chars of think). This model ignores no-think controls "
+                "â€” try a non-'reasoning'/non-aggressive build, or a different model."
+            )
+        return stripped
+
+    def _extract_draft_from_reasoning(self, text: str) -> str:
+        """Try to pull the final draft paragraph out of a raw reasoning blob.
+
+        Qwen 3.5 uncensored models consistently structure their thinking output as:
+          1. Analysis / deconstruction
+          2. Drafting section
+          3. "Revised Draft:" or "Final Draft:" followed by the actual output
+          4. Optional review / token count check
+          5. "Ready to output." or similar terminator
+
+        This method finds the last "Revised Draft:" or "Draft Construction:" marker
+        and returns only the paragraph that follows it, stripping any trailing
+        meta-lines and artifacts.
+
+        Returns empty string if no recognisable draft marker is found.
+        """
+        if not text:
+            return ""
+
+        # Find the last occurrence of a draft marker line
+        # (last because sometimes there are multiple draft iterations)
+        # Covers Qwen 3.5 patterns: "Revised Draft:", "Final Draft:", "Final Prompt:",
+        # "**Final Prompt:**", "Draft Construction:", "Here is the prompt:", etc.
+        markers = list(re.finditer(
+            r"(?im)^.*?(\*{0,2}(revised|final)\s+(draft|prompt|output)\*{0,2}\s*:|"  # noqa: W503
+            r"draft\s+construction\s*:|here\s+is\s+(the\s+)?(final\s+)?(prompt|output)\s*:|"  # noqa: W503
+            r"^6\.\s+\*{0,2}draft).*$",
+            text
+        ))
+        if not markers:
+            return ""
+
+        # Take everything after the last marker
+        after = text[markers[-1].end():].strip()
+        if not after:
+            return ""
+
+        # Strip all trailing meta/review lines Qwen 3.5 appends after the draft paragraph.
+        # Applied in a loop until no more matches â€” lines can stack.
+        for _ in range(10):
+            before = after
+            after = re.sub(
+                r"(?im)^\s*(ready\s+to\s+output|looks\s+(solid|good|tight)|final\s+(check|review|polish|output)[^\n]*|token\s+count[^\n]*|approx\.?\s*\d+\s+tokens[^\n]*|good\s+range[^\n]*|section\s+order[^\n]*|let'?s\s+refine[^\n]*|check\s+for\s+(nsfw|aspect)[^\n]*)\.*\s*$",
+                "", after
+            ).strip()
+            if after == before:
+                break
+
+        # Strip trailing cw artifact
+        after = re.sub(r"(?m)cw\s*$", "", after).strip()
+
+        # If what remains still looks like reasoning, give up
+        if _looks_like_reasoning(after):
+            return ""
+
+        return after
+
+    def _invoke_with_retry(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        media_content: list[dict],
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        repetition_penalty: float,
+        seed: int,
+    ) -> str:
+        """Invoke with reasoning detection, draft extraction, and retry.
+
+        Strategy (in order):
+        1. _invoke() strips tagged <think> blocks and known Qwen 3.5 raw reasoning markers.
+        2. If output still looks like reasoning, attempt to extract the final draft
+           paragraph directly from the blob â€” the answer is usually in there.
+        3. Only if extraction fails, fire a retry with a tight system prompt.
+        """
+        raw = self._invoke(system_prompt, user_prompt, media_content, max_tokens, temperature, top_p, repetition_penalty, seed)
+
+        if not _looks_like_reasoning(raw):
+            # Clean output â€” run through cleaner and return
+            return clean_model_output(raw, OutputCleanConfig(mode="prompt")) or raw.strip()
+
+        # Reasoning detected â€” try to extract the draft before retrying
+        print("[Luna-LLMPrompt] Reasoning detected in output. Attempting draft extraction.")
+        extracted = self._extract_draft_from_reasoning(raw)
+        if extracted:
+            print("[Luna-LLMPrompt] Draft extracted successfully.")
+            return clean_model_output(extracted, OutputCleanConfig(mode="prompt")) or extracted.strip()
+
+        # Extraction failed â€” retry with a tight prompt, feeding back only the raw blob
+        print("[Luna-LLMPrompt] Extraction failed. Retrying with distillation prompt.")
+        retry_system = (
+            "You are a professional prompt writer.\n"
+            "Output ONLY ONE final prompt paragraph.\n"
+            "No analysis, no planning steps, no first-person.\n"
+            "No bullet points, no headings, no JSON, no markdown, no quotes."
+        )
+        retry_user = f"Extract and rewrite only the final image prompt from the following text:\n\n{raw}"
+        raw_retry = self._invoke(retry_system, retry_user, [], max_tokens, 0.4, 0.95, 1.05, seed + 999)
+
+        if not _looks_like_reasoning(raw_retry):
+            cleaned_retry = clean_model_output(raw_retry, OutputCleanConfig(mode="prompt"))
+            if cleaned_retry:
+                return cleaned_retry
+
+        # Both extraction and retry failed — return whatever _strip_think_blocks gave us
+        # Use keep_first_paragraph_only so trailing notes/analysis are dropped.
+        print("[Luna-LLMPrompt] Warning: could not clean reasoning output. Returning best effort.")
+        cleaned = clean_model_output(raw, OutputCleanConfig(mode="prompt", keep_first_paragraph_only=True))
+        return cleaned or raw.strip()
+
+    # ------------------------------------------------------------------
+    # Main entry point
+    # ------------------------------------------------------------------
+
+    def generate(
+        self,
+        model_name: str,
+        system_prompt: str,
+        custom_system_prompt: str,
+        user_prompt: str,
+        output_format: str,
+        split_output: bool,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        min_p: float,
+        repetition_penalty: float,
+        device: str,
+        auto_settings: bool,
+        disable_thinking: bool,
+        keep_model_loaded: bool,
+        seed: int,
+        n_ctx: int = 8192,
+        n_gpu_layers: int = -1,
+        presence_penalty: float = 0.0,
+        frequency_penalty: float = 0.0,
+        preserve_thinking: bool = False,
+        image_min_tokens: int = 1024,
+        image_max_tokens: int = 4096,
+        load_mmproj: str = "auto",
+        mtp_draft_tokens: int = 0,
+        reasoning_budget: int = -1,
+        video_fps: float = 1.0,
+        verbose_logging: bool = False,
+        vision_mp: float = 0.0,
+        validate: str = "off",
+        quality: str = "custom",
+        style: str = "",
+        context: str = "",
+        width: int = 0,
+        height: int = 0,
+        image=None,
+        reference_image=None,
+        video=None,
+        audio=None,
+        frames: int = 0,
+        media_override: list[dict] | None = None,
+    ):
+        # Gate the chatty status prints for this run (warnings/errors still show).
+        self._verbose = bool(verbose_logging)
+        self.last_stats = {}
+        # ---- Quality level ---------------------------------------------------
+        # A level sets thinking, the reasoning budget and MTP over the widgets;
+        # "custom" (and the luna_writer_api default) keeps the widget values.
+        level = QUALITY_LEVELS.get((quality or "custom").lower())
+        if level is not None:
+            disable_thinking = not level["thinking"]
+            reasoning_budget = level["reasoning_budget"]
+            mtp_draft_tokens = level["mtp_draft_tokens"]
+            self._vprint(
+                f"[Luna-LLMPrompt] quality={quality} -> thinking={'on' if level['thinking'] else 'off'}, "
+                f"reasoning_budget={reasoning_budget}, mtp_draft_tokens={mtp_draft_tokens}"
+            )
+        # ---- Server-side model-specific settings ----------------------------
+        # The frontend JS preset only fires on a manual dropdown click, so on
+        # workflow load / node creation / refresh the sliders keep stale or wrong
+        # values (e.g. Gemma running at temp 0.6 / min_p 0.05 instead of 1.0 / 0).
+        # When auto_settings is ON we resolve the OFFICIAL settings for the model
+        # family here and override the widgets — guaranteed correct every run.
+        # On "custom" it also forces thinking OFF (the node's behaviour before the
+        # quality levels); a level decides thinking itself and gets the family's
+        # thinking-mode sampling when thinking is on.
+        # presence_penalty arrives from the widget; auto_settings may override it.
+        if auto_settings:
+            thinking_on = level is not None and not disable_thinking
+            resolved = _resolve_model_settings((model_name or "").lower(), thinking=thinking_on)
+            if resolved:
+                if level is None:
+                    disable_thinking = True
+                temperature = resolved["temperature"]
+                top_p = resolved["top_p"]
+                top_k = resolved["top_k"]
+                min_p = resolved["min_p"]
+                repetition_penalty = resolved["repetition_penalty"]
+                presence_penalty = resolved["presence_penalty"]
+                self._vprint(
+                    f"[Luna-LLMPrompt] auto_settings ON -> temp={temperature}, top_p={top_p}, "
+                    f"top_k={top_k}, min_p={min_p}, presence_penalty={presence_penalty}, "
+                    f"rep={repetition_penalty}, thinking={'OFF' if disable_thinking else 'ON'}"
+                )
+            else:
+                self._vprint(
+                    f"[Luna-LLMPrompt] auto_settings ON but no known preset for "
+                    f"'{model_name}' â€” using the slider values as-is."
+                )
+
+        # Resolve system prompt
+        if custom_system_prompt and custom_system_prompt.strip():
+            sys_prompt = custom_system_prompt.strip()
+        else:
+            sys_prompt = SYSTEM_PROMPTS.get(system_prompt, "")
+
+        if not sys_prompt:
+            sys_prompt = (
+                "You are a professional prompt writer. "
+                "Generate a detailed, vivid prompt based on the user's input. "
+                "Output only the final prompt text."
+            )
+
+        # Append output format instruction
+        if output_format == "json":
+            sys_prompt += (
+                "\n\nReturn the output as valid JSON only. "
+                "No preface, no explanations, no markdown fences, no </think>. "
+                "Do not wrap in code blocks."
+            )
+        elif output_format == "list":
+            sys_prompt += (
+                "\n\nOutput only the numbered list exactly as specified in your instructions. "
+                "No preface, no explanations, no analysis, no markdown fences, no </think>. "
+                "Keep every item on its own numbered line."
+            )
+        else:
+            sys_prompt += (
+                "\n\nReturn only the final prompt text. "
+                "No preface, no explanations, no analysis, no JSON, no markdown fences, and no </think>.\n"
+                "Do not write planning steps (no 'First', 'Next', 'Then') and do not use first-person ('I', 'we')."
+            )
+            # Authoritative positive/negative delimiter contract. Appended LAST so
+            # it overrides any pipe instruction a preset may carry. Labelled
+            # markers survive far better than a bare '|'; the parser strips them
+            # so no '[POSITIVE]'/'[NEGATIVE]' text ever reaches the outputs.
+            if split_output:
+                sys_prompt += (
+                    "\n\nIf your instructions produce a NEGATIVE prompt, format your entire "
+                    "answer EXACTLY like this, each marker on its own line:\n"
+                    "[POSITIVE]\n<the full positive prompt>\n[NEGATIVE]\n<the full negative prompt>\n"
+                    "Write nothing before [POSITIVE] and nothing after the negative prompt. "
+                    "If there is no negative prompt, write [POSITIVE] then your prompt and stop."
+                )
+
+        # Qwen 3.5 thinking suppression: /no_think is the official control token
+        # recognized by Qwen 3.5's embedded chat template.
+        # Uses self.loaded_model_name_lower set at model load time â€” no signature parsing.
+        m_name_lower = self.loaded_model_name_lower
+        is_qwen35 = (
+            (self.loaded_model_arch or "") in Qwen35Adapter.ARCHES
+            or "qwen3.5" in m_name_lower
+            or "qwen3-5" in m_name_lower
+            or "qwen35" in m_name_lower
+        )
+        if is_qwen35 and disable_thinking:
+            sys_prompt = "/no_think\n" + sys_prompt + "\n/no_think"
+
+        # Effective canvas dims: wired width/height, else fall back to the input
+        # image's dims so the composition is ALWAYS aspect-ratio-driven.
+        eff_w, eff_h = width, height
+        if (eff_w <= 0 or eff_h <= 0) and image is not None:
+            try:
+                eff_h, eff_w = int(image.shape[1]), int(image.shape[2])
+            except Exception:
+                pass
+
+        # Build user prompt — LEAD with the aspect-ratio canvas profile so framing
+        # is the first thing the model reads, then user prompt / style.
+        parts = []
+        if eff_w > 0 and eff_h > 0:
+            canvas_block = _build_canvas_profile(eff_w, eff_h)
+            if canvas_block:
+                parts.append(canvas_block)
+        # Upstream analysis (stage 1 of a two-stage graph) reads before the request,
+        # so the bulky reference material lands first and the instruction lands last.
+        if context and context.strip():
+            parts.append(f"REFERENCE CONTEXT:\n{context.strip()}")
+        if user_prompt and user_prompt.strip():
+            parts.append(f"USER PROMPT:\n{user_prompt.strip()}")
+        if style and style.strip():
+            parts.append(f"STYLE DESCRIPTION:\n{style.strip()}")
+
+        final_user_prompt = "\n\n".join(parts) if parts else "Describe a scene vividly."
+
+        # Qwen 3.x native control token: tells thinking models to skip the
+        # thinking phase entirely and output the answer directly. Massive speed
+        # win (~3x). Ignored silently by non-Qwen models, so safe to always append.
+        # Gated on disable_thinking so users who want reasoning can get it.
+        if disable_thinking and "qwen" in (model_name or "").lower() and "/no_think" not in final_user_prompt:
+            final_user_prompt = f"{final_user_prompt}\n\n/no_think"
+
+
+        # ---- Build the multimodal content list (image / reference / video / audio)
+        # Each item is an OpenAI-style content dict, ordered and labelled here so
+        # _invoke just prepends the user-prompt text and sends it.
+        # media_override (luna_writer_api) is a ready content list that
+        # replaces this whole assembly; the node never passes it.
+        media_content: list[dict] = []
+
+        if media_override is not None:
+            media_content = list(media_override)
+        else:
+            # Main image(s). When a reference image is also present, label this one so
+            # the model knows which is the content source vs the style source.
+            if image is not None:
+                # NB: not `frames` — that name is the clip's frame-count input.
+                img_frames = [image[i] for i in range(image.shape[0])] if image.ndim == 4 else [image]
+                if reference_image is not None and img_frames:
+                    media_content.append({"type": "text", "text": "Input Image:"})
+                for fr in img_frames:
+                    media_content.append(_image_tensor_to_content(fr, max_mp=vision_mp))
+
+            # Reference image for style-transfer prompts.
+            if reference_image is not None:
+                media_content.append({"type": "text", "text": "Reference Image:"})
+                ref_frame = reference_image[0] if reference_image.ndim == 4 else reference_image
+                media_content.append(_image_tensor_to_content(ref_frame, max_mp=vision_mp))
+
+            # Video frames, FPS-subsampled and context-budget aware.
+            if video is not None:
+                media_content.extend(
+                    _video_tensor_to_contents(video, target_fps=video_fps, n_ctx=n_ctx)
+                )
+
+            # Audio (Gemma-4 audio projector only). Never hard-fail on audio issues.
+            if audio is not None:
+                try:
+                    media_content.append(_audio_to_content(audio))
+                except Exception as e:
+                    print(f"[Luna-LLMPrompt] Audio could not be encoded ({e}); ignoring audio input.")
+
+        # Load model and generate. want_vision drives whether we load the vision
+        # handler at all â€” only when image/reference/video/audio is connected
+        # (or media_override is non-empty).
+        # With no media, Qwen loads text-only so the no-think template engages.
+        want_vision = bool(media_content)
+        try:
+            self._load_model(
+                model_name, device, n_ctx=n_ctx, n_gpu_layers=n_gpu_layers,
+                disable_thinking=disable_thinking, want_vision=want_vision,
+                preserve_thinking=preserve_thinking,
+                image_min_tokens=image_min_tokens, image_max_tokens=image_max_tokens,
+                load_mmproj=load_mmproj, mtp_draft_tokens=mtp_draft_tokens,
+            )
+
+            if media_content and self.chat_handler is None:
+                print("[Luna-LLMPrompt] Warning: media provided but no vision/audio projector. Media will be ignored.")
+
+            # All output formats route through _invoke() directly.
+            # _invoke() returns text already cleaned by _strip_think_blocks().
+            # No reasoning detection, no retry loops, no false positives.
+            result = self._invoke(
+                system_prompt=sys_prompt,
+                user_prompt=final_user_prompt,
+                media_content=media_content if self.chat_handler is not None else [],
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                min_p=min_p,
+                repetition_penalty=repetition_penalty,
+                seed=seed,
+                disable_thinking=disable_thinking,
+                presence_penalty=presence_penalty,
+                frequency_penalty=frequency_penalty,
+                reasoning_budget=reasoning_budget,
+            )
+
+            # Positive/negative parsing is now fully handled by the hardened
+            # split_positive_negative() below (markers -> labels -> pipe -> JSON),
+            # so the old normalize-to-pipe pre-pass is no longer needed.
+
+            # NOTE: Qwen 3.5 cache-clear was tried here but caused mixed output
+            # when the _ctx.memory_clear() call silently failed on some
+            # llama-cpp-python versions — leaving n_tokens=0 with stale KV cache.
+            # If the "works twice then stops" issue returns, the right fix is to
+            # toggle keep_model_loaded=False, not to manipulate cache internals.
+
+            # Split 'positive|negative' into the two outputs (or full text on
+            # positive + empty negative when split_output is off / no pipe).
+            positive, negative = split_positive_negative(result, split_output)
+
+            log = ""
+            if validate == "h3":
+                positive, findings = validate_h3(positive, frames or None)
+                log = format_log(positive, frames or None, findings)
+                print(f"[Luna-LLMPrompt] {log}")
+
+            # With thinking on, the reasoning is stripped from the prompt but is
+            # the most useful thing to inspect - surface it here rather than
+            # discarding it. Appended so an h3 validation report keeps the lead.
+            reasoning = getattr(self, "last_reasoning", "") or ""
+            if reasoning:
+                block = f"--- reasoning ({len(reasoning.split())} words) ---\n{reasoning}"
+                log = f"{log}\n\n{block}" if log else block
+            if self.last_stats:
+                self.last_stats["reasoning_words"] = len(reasoning.split())
+                self.last_stats["quality"] = (quality or "custom").lower()
+
+            return (positive, negative, log)
+
+        finally:
+            if not keep_model_loaded:
+                self.clear()
+
+
+# ---------------------------------------------------------------------------
+# V3 node (comfy_api schema) — thin wrapper over the module-level runner
+# ---------------------------------------------------------------------------
+
+# Single cached runner shared across executions (V3 nodes are stateless).
+_RUNNER = _LLMRunner()
+
+# One GGUF run at a time: the node and luna_writer_api (which calls
+# _RUNNER.generate in-process from an executor thread) both hold this lock,
+# so a graph run and a writer-interface call never load or invoke the runner at once.
+_RUNNER_LOCK = threading.Lock()
+
+
+class LLMPromptNode(io.ComfyNode):
+    """V3 prompt-generation node — local GGUF vision/text models via llama-cpp.
+
+    The heavy lifting (model cache, loading, inference, cleanup) lives in the
+    module-level _LLMRunner. node_id and widget names are kept identical to the
+    old V1 node so existing workflows and llm_prompt_presets.js keep working.
+    """
+
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        # Rescan on each schema build so freshly added models/prompts appear
+        # without a restart (same behaviour as the old INPUT_TYPES).
+        models = _refresh_model_list()
+        model_keys = sorted(models.keys()) or ["(no .gguf files found in models/LLM)"]
+        prompt_presets = list(SYSTEM_PROMPTS.keys()) if SYSTEM_PROMPTS else ["(add .md files to prompts/)"]
+        gpu_list = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
+        device_options = ["auto", "cpu", "mps"] + gpu_list
+
+        return io.Schema(
+            node_id="Luna-LLMPrompt",
+            display_name="Luna-LLMPrompt",
+            category="Luna-LLM-Tools",
+            description=(
+                "Prompt generation via local GGUF vision/text models (llama-cpp). "
+                "Qwen 2.5/3/3.5/3.6 and Gemma 3/4 with automatic family detection, "
+                "handler-level thinking control, and image/video/audio inputs."
+            ),
+            inputs=[
+                # ===== BASIC (always visible) =====
+                io.Combo.Input("model_name", options=model_keys, default=model_keys[0],
+                               tooltip="Which local model to use - pick a Qwen or Gemma file from models/LLM. "
+                                       "Vision needs a matching mmproj in the same folder."),
+                io.Combo.Input("system_prompt", options=prompt_presets, default=prompt_presets[0],
+                               tooltip="Prompt-style preset from your prompts folder "
+                                       "(Reverse Engineered, Style Transfer, SDXL...)."),
+                io.String.Input("custom_system_prompt", multiline=True, default="",
+                                tooltip="Optional - your own instructions; overrides the preset above. "
+                                        "Leave empty to use the preset."),
+                io.String.Input("user_prompt", multiline=True, default="",
+                                tooltip="Your idea or subject. This is what the model turns into a finished prompt."),
+                io.Combo.Input("output_format", options=["text", "json", "list"], default="text",
+                               tooltip="text = one finished prompt (normal). json = structured data. "
+                                       "list = numbered scenes for multi-shot video."),
+                io.Boolean.Input("split_output", default=True,
+                                 tooltip="ON splits a 'positive | negative' result into the two outputs. "
+                                         "Leave ON for SDXL; harmless for Flux/Chroma (no negative)."),
+                io.Boolean.Input("auto_settings", default=True,
+                                 tooltip="Recommended ON. Auto-applies the best sampling for your model family "
+                                         "(Qwen / Gemma) and skips reasoning. OFF = control sampling yourself "
+                                         "in Advanced."),
+                io.Boolean.Input("disable_thinking", default=True,
+                                 tooltip="Skip the model's reasoning block (recommended, faster). Only takes effect "
+                                         "when auto_settings is OFF - auto already forces it off."),
+                io.Float.Input("temperature", default=0.7, min=0.1, max=2.0, step=0.05,
+                               tooltip="Creativity/randomness. Ref: Qwen ~0.7, Gemma ~1.0. Lower = focused, "
+                                       "higher = varied. Range 0.1-2.0. Only used when auto_settings is OFF."),
+                io.Int.Input("max_tokens", default=2048, min=64, max=32000,
+                             tooltip="Max length of the result. Ref: ~512 short, 2048 a full prompt, "
+                                     "4096+ for multi-scene lists. Raise if output gets cut off. With thinking ON "
+                                     "the reasoning gets its own room on top (reasoning_budget, or the context)."),
+                io.Int.Input("n_ctx", default=8192, min=2048, max=262144, step=256,
+                             tooltip="How much text the model reads at once (input + reasoning + output). "
+                                     "Ref: 8192 default (Krea with thinking ~7k; Gemma drafter MTP only at 8k or "
+                                     "less), 16384-32768 with images or video. Higher = more VRAM."),
+                io.Int.Input("seed", default=1, min=1, max=2**32 - 1,
+                             tooltip="Change for a different result; same seed = same output. "
+                                     "Set 'control after generate' to randomize for variety."),
+                io.Boolean.Input("keep_model_loaded", default=True,
+                                 tooltip="ON keeps the model in VRAM (instant next run). "
+                                         "OFF frees VRAM after each run."),
+
+                # ===== ADVANCED (collapsed by default via advanced=True) =====
+                # --- Manual sampling: only used when auto_settings is OFF ---
+                io.Float.Input("top_p", default=0.9, min=0.0, max=1.0, step=0.05, advanced=True,
+                               tooltip="Nucleus sampling. Ref: Qwen ~0.8, Gemma ~0.95. Lower = safer wording. "
+                                       "Range 0-1. Only when auto_settings is OFF."),
+                io.Int.Input("top_k", default=30, min=0, max=200, advanced=True,
+                             tooltip="Limit choices to the top K tokens. Ref: Qwen 20, Gemma 64, 0 = off. "
+                                     "Only when auto_settings is OFF."),
+                io.Float.Input("min_p", default=0.05, min=0.0, max=1.0, step=0.01, advanced=True,
+                               tooltip="Quality floor - drops low-probability tokens. Ref: 0.0-0.05. "
+                                       "Only when auto_settings is OFF."),
+                io.Float.Input("repetition_penalty", default=1.0, min=0.5, max=2.0, step=0.05, advanced=True,
+                               tooltip="Discourages repeating words. Ref: 1.0 = off (Gemma), 1.05-1.1 if it loops. "
+                                       "Only when auto_settings is OFF."),
+                io.Float.Input("presence_penalty", default=0.0, min=-2.0, max=2.0, step=0.1, advanced=True,
+                               tooltip="Discourages reusing any seen token. Ref: 0.0 default, 1.5 for Qwen anti-loop. "
+                                       "Only when auto_settings is OFF."),
+                io.Float.Input("frequency_penalty", default=0.0, min=-2.0, max=2.0, step=0.1, advanced=True,
+                               tooltip="Penalizes frequent tokens. Ref: 0.0 default, 0.1-0.5 to reduce repetition. "
+                                       "Only when auto_settings is OFF."),
+                io.Int.Input("reasoning_budget", default=-1, min=-1, max=32000, step=1, advanced=True,
+                             tooltip="Cap on thinking tokens when thinking is ON (like LM Studio's budget). "
+                                     "-1 = unlimited, 0 = no thinking, N = stop thinking after N tokens and "
+                                     "write the answer. Ref: 1024-2048. Qwen 3.5+/Gemma 4 only."),
+                io.Boolean.Input("preserve_thinking", default=False, advanced=True,
+                                 tooltip="Qwen 3.5/3.6 only: keep <think> traces for all prior turns. "
+                                         "Leave OFF for single-shot prompts."),
+                # --- Hardware / VRAM ---
+                io.Combo.Input("device", options=device_options, default="auto", advanced=True,
+                               tooltip="Where to run. 'auto' = GPU if available (recommended). Use cpu only if forced."),
+                io.Int.Input("n_gpu_layers", default=-1, min=-1, max=200, step=1, advanced=True,
+                             tooltip="Model layers on GPU. Ref: -1 = all (best). Lower (20-40) only if a big model "
+                                     "runs out of VRAM. CPU forces 0."),
+                io.Int.Input("mtp_draft_tokens", default=0, min=0, max=8, step=1, advanced=True,
+                             tooltip="MTP speed-up: the model's own MTP heads guess this many tokens ahead and "
+                                     "the model checks them - same quality, faster. Ref: 0 = off, 2-3 = best. "
+                                     "Needs an MTP build of the model (e.g. '...-MTP-GGUF') and text-only runs; "
+                                     "skipped otherwise (the console says why). ~2x on Qwen3.6 27B, RTX 4090."),
+                # --- Vision / video ---
+                io.Combo.Input("load_mmproj", options=["auto", "always", "never"],
+                               default="auto", advanced=True,
+                               tooltip="Whether to load the vision projector alongside the model. "
+                                       "'auto' = only when an image/video/audio is connected — saves "
+                                       "0.6-1.1 GB VRAM and the reserved image-token budget on text runs. "
+                                       "'always' keeps it loaded so bypassing an image node doesn't force "
+                                       "a full model reload. 'never' = text-only, most context headroom. "
+                                       "VL models ignore this and always keep their projector."),
+                io.Int.Input("image_min_tokens", default=1024, min=256, max=4096, step=64, advanced=True,
+                             tooltip="Min visual tokens per image (Qwen VL). Ref: 256 light, 1024 default, "
+                                     "up to 4096 fine detail. Higher = more VRAM."),
+                io.Int.Input("image_max_tokens", default=4096, min=1024, max=16384, step=64, advanced=True,
+                             tooltip="Max visual tokens per image. Ref: 1024-4096 typical, up to 16384. "
+                                     "Must be >= image_min_tokens."),
+                io.Float.Input("video_fps", default=1.0, min=0.1, max=5.0, step=0.1, advanced=True,
+                               tooltip="Frames/sec sampled from connected video. Ref: 1.0 default, 0.5 long clips, "
+                                       "2-5 fast motion. Only with the video input."),
+                # --- Debug ---
+                io.Boolean.Input("verbose_logging", default=False, advanced=True,
+                                 tooltip="Print detailed step-by-step info to the console. OFF = quiet log; "
+                                         "ON to troubleshoot. (Does not affect generation.)"),
+                io.Float.Input("vision_mp", default=0.0, min=0.0, max=8.0, step=0.1, advanced=True,
+                               tooltip="Downscale input images to at most this many megapixels before encoding. 0 = off (send at full size). ~1.0 is plenty for reference reading and saves context and time."),
+                io.Combo.Input("validate", options=["off", "h3"], default="off", advanced=True,
+                               tooltip="Check the output's format and report findings on the `log` output. 'h3' checks MiniMax H3 prompts: section names and order, no mixing of the 3-field and 6-section formats, shot numbering, cut timestamps, labels, dialogue tags. Only the S.SS in an alignment line is repaired, and only when `frames` is wired."),
+                # Last widget on purpose: saved workflows store widget values by
+                # position, so a new widget at the end shifts nothing. Optional, so an
+                # API-format prompt saved before it still validates (generate()
+                # treats a missing quality as "custom" = the old behaviour).
+                io.Combo.Input("quality", options=QUALITY_OPTIONS, default="fast", optional=True,
+                               tooltip="Prompt quality. fast = no thinking (~10 s). normal = thinks up to 1024 "
+                                       "tokens (~25 s). quality = up to 2048. ultra = unlimited thinking (~50 s). "
+                                       "All use MTP when the model has it. custom = use the thinking, "
+                                       "reasoning_budget and mtp_draft_tokens settings as set."),
+
+                # ===== Optional connections (input sockets) =====
+                io.String.Input("style", optional=True, force_input=True,
+                                tooltip="Style description from an external node."),
+                io.String.Input("context", optional=True, force_input=True,
+                                tooltip="Upstream analysis from another node (e.g. a vision-reader Luna-LLMPrompt). Appended as its own labelled block ahead of your prompt."),
+                io.Int.Input("width", optional=True, force_input=True,
+                             tooltip="Image width - auto-detected as an aspect-ratio composition profile."),
+                io.Int.Input("height", optional=True, force_input=True,
+                             tooltip="Image height - auto-detected as an aspect-ratio composition profile."),
+                io.Image.Input("image", optional=True, tooltip="Input image for vision analysis."),
+                io.Image.Input("reference_image", optional=True,
+                               tooltip="Reference image for style-transfer prompts (the style source)."),
+                io.Image.Input("video", optional=True, tooltip="Video frames [F,H,W,3] for vision analysis."),
+                io.Audio.Input("audio", optional=True, tooltip="Audio input (Gemma-4 audio projector only)."),
+                io.Int.Input("frames", optional=True, force_input=True,
+                             tooltip="The clip's real frame count, for `validate`. Lets S.SS and the cut times be checked against the actual duration instead of just their format."),
+            ],
+            outputs=[
+                io.String.Output("positive", display_name="positive"),
+                io.String.Output("negative", display_name="negative"),
+                io.String.Output("log", display_name="log"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, **kwargs) -> io.NodeOutput:
+        # Drop any framework-injected extras the runner doesn't expect, then run.
+        call_kwargs = _filter_kwargs_for_callable(_LLMRunner.generate, kwargs)
+        with _RUNNER_LOCK:
+            positive, negative, log = _RUNNER.generate(**call_kwargs)
+            stats = dict(getattr(_RUNNER, "last_stats", {}) or {})
+            reasoning = getattr(_RUNNER, "last_reasoning", "") or ""
+        # The node face reads these in onExecuted: the last-run line and its
+        # "view thinking" link (the same reasoning the `log` output carries).
+        ui = {"llm_stats": [stats]} if stats else {}
+        if stats and reasoning:
+            ui["llm_reasoning"] = [reasoning]
+        return io.NodeOutput(positive, negative, log, ui=ui or None)
+
+
+# ---------------------------------------------------------------------------
+# ComfyUI registration — V3 io.ComfyNode classes register fine through the
+# classic NODE_CLASS_MAPPINGS path (they carry a V1-compat shim), so the
+# package's existing __init__ aggregation with the API/Grok nodes is unchanged.
+# ---------------------------------------------------------------------------
+
+_QUANT_RE = re.compile(r"(?i)(?<![A-Za-z0-9])(IQ\d_[A-Z]+|Q\d_K_[A-Z]+|Q\d_K|Q\d_\d|Q\d|BF16|F16|F32)(?![A-Za-z0-9])")
+
+
+def _model_info(display_name: str) -> dict:
+    """Facts about one model-list entry, for the node face's model card."""
+    entry = _refresh_model_list().get(display_name)
+    if not entry:
+        return {"found": False}
+    path = Path(entry["full_path"])
+    quant = _QUANT_RE.findall(path.stem)
+    arch = _read_gguf_arch(path) or ""
+    try:
+        size_gb = round(path.stat().st_size / 1024**3, 1)
+    except OSError:
+        size_gb = 0.0
+    sig = _RUNNER.current_signature or {}
+    loaded = _RUNNER.llm is not None and sig.get("model_path") == str(path)
+    return {
+        "found": True,
+        "quant": quant[-1].upper() if quant else "",
+        "arch": arch,
+        "mtp": _gguf_mtp_layers(path, arch) > 0,
+        "mtp_drafter": (lambda d: d.name if d else "")(_find_mtp_drafter(path, arch)),
+        "vision": bool(entry.get("mmproj_path")),
+        "size_gb": size_gb,
+        "loaded": loaded,
+        "n_ctx": int(sig.get("n_ctx", 0)) if loaded else 0,
+        "mtp_active": int(sig.get("mtp_draft", 0)) if loaded else 0,
+    }
+
+
+try:
+    from server import PromptServer
+    from aiohttp import web as _aiohttp_web
+
+    @PromptServer.instance.routes.get("/llm_prompt/model_info")
+    async def _llm_prompt_model_info_route(request):
+        try:
+            info = _model_info(request.query.get("name", ""))
+        except Exception as exc:  # never 500 the frontend
+            info = {"found": False, "error": str(exc)}
+        return _aiohttp_web.json_response(info)
+except Exception:
+    pass  # outside ComfyUI (tests): no server
+
+
+NODE_CLASS_MAPPINGS = {
+    "Luna-LLMPrompt": LLMPromptNode,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "Luna-LLMPrompt": "Luna-LLMPrompt",
+}

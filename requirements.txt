@@ -1,0 +1,13 @@
+# What the code in this pack needs beyond ComfyUI itself.
+# torch, av, aiohttp, folder_paths and comfy_api come with ComfyUI.
+Pillow
+numpy
+# Prompt preset frontmatter (Luna-LLMPrompt, Luna-LLMPromptAPI); without it filenames become preset labels.
+PyYAML
+# Gemini: Luna-LLMPromptAPI (Gemini provider), Luna-GeminiImage, Luna-GeminiOmniVideo.
+google-genai
+# Optional, only when audio is wired into a prompt writer.
+soundfile
+torchaudio
+# Luna-LLMPrompt (local GGUF) needs llama-cpp-python, which is not listed here on purpose: use the JamePeng
+# build that matches your CUDA and Python (docs/llama_cpp_windows_install.md, tools/llama_cpp_windows_doctor.py).

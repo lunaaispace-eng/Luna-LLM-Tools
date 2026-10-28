@@ -1,0 +1,272 @@
+{
+  "Photorealism": {
+    "name": "Photorealism",
+    "category": "Photography",
+    "subcategory": "Realistic",
+    "content": "photorealistic photography, believable natural light, accurate perspective, true-to-life proportions, authentic materials, fine surface detail, convincing depth of field, physically grounded, realistic color, natural texture, accurate shadow, lifelike optical behavior, sharp focus, unretouched realism"
+  },
+  "NaturalLightRealism": {
+    "name": "Natural Light Realism",
+    "category": "Photography",
+    "subcategory": "Realistic",
+    "content": "natural light realism, daylight, window light, open shade, soft ambient light, gentle light falloff, true-to-life color relationships, physically present shadows, observed rather than staged, preserved atmosphere, subtle imperfection, natural exposure, quiet visual truth"
+  },
+  "DocumentaryRealism": {
+    "name": "Documentary Realism",
+    "category": "Photography",
+    "subcategory": "Realistic",
+    "content": "documentary realism, honest immediate and unstaged, authentic environments, natural gestures, available light, lived-in detail, small imperfections, candid moment, attentive human composition, witnessed rather than arranged, journalistic honesty, real atmosphere"
+  },
+  "StudioRealism": {
+    "name": "Studio Realism",
+    "category": "Photography",
+    "subcategory": "Realistic",
+    "content": "controlled studio realism, precise lighting, clean tonal separation, accurate color, refined texture, clear form, believable materials, natural anatomy, polished and intentional, professional studio setup, controlled shadow, natural finish without plastic sheen"
+  },
+  "CinematicRealism": {
+    "name": "Cinematic Realism",
+    "category": "Photography",
+    "subcategory": "Realistic",
+    "content": "grounded live-action film still, realistic light, physical detail, purposeful framing, atmospheric depth, controlled contrast, cinematic color grade, story beyond the frame, emotional tension, cinematic presence, believable anatomy, environmental logic, anamorphic feel"
+  },
+  "EditorialRealism": {
+    "name": "Editorial Realism",
+    "category": "Photography",
+    "subcategory": "Realistic",
+    "content": "refined editorial realism, elegant visual hierarchy, intentional styling, believable texture, clean confident composition, polished lighting, precise detail, natural skin and fabric, sophisticated contemporary mood, minimal retouching, magazine-quality finish"
+  },
+  "EnvironmentalRealism": {
+    "name": "Environmental Realism",
+    "category": "Photography",
+    "subcategory": "Realistic",
+    "content": "environmental realism, subject and setting unified, coherent scale, credible spatial relationships, natural light interaction, meaningful background detail, architecture and landscape context, weather and atmosphere, storytelling environment, believable depth"
+  },
+  "GrittyRealism": {
+    "name": "Gritty Realism",
+    "category": "Photography",
+    "subcategory": "Realistic",
+    "content": "gritty realism, weathered surfaces, visible grain, honest skin and fabric texture, practical light, marks of use age and labor, raw but coherent, tactile physical truth, muted worn palette, unpolished authenticity"
+  },
+  "LowKeyRealism": {
+    "name": "Low Key Realism",
+    "category": "Photography",
+    "subcategory": "Realistic",
+    "content": "low-key realism, deep detailed shadows, restrained highlights, controlled pools of light, gradual tonal transitions, believable light falloff, intimate mood, weighty mysterious atmosphere, texture preserved inside shadow, dark rich tones"
+  },
+  "HighKeyRealism": {
+    "name": "High Key Realism",
+    "category": "Photography",
+    "subcategory": "Realistic",
+    "content": "high-key realism, luminous exposure, soft shadows, airy tonal range, clean natural color, detailed bright surfaces, delicate subject-to-background separation, open calm refined mood, physically believable brightness, gentle contrast"
+  },
+  "AmbientRealism": {
+    "name": "Ambient Realism",
+    "category": "Photography",
+    "subcategory": "Realistic",
+    "content": "ambient realism, mixed practical lamps, reflected light, sky glow, interior light spill, environmental color, naturally inhabited scene, realistic exposure, quiet tonal transitions, soft light wrapping faces and objects, lived-in atmosphere"
+  },
+  "UrbanRealism": {
+    "name": "Urban Realism",
+    "category": "Photography",
+    "subcategory": "Realistic",
+    "content": "urban realism, believable streets, city architecture, wet reflections, signage, weather, artificial city light, everyday human presence, dense coherent city atmosphere, lived-in detail, spontaneous composition, public-space mood"
+  },
+  "LifestyleRealism": {
+    "name": "Lifestyle Realism",
+    "category": "Photography",
+    "subcategory": "Realistic",
+    "content": "lifestyle realism, relaxed contemporary mood, genuinely lived scene, natural gestures, practical environments, believable clothing, soft directional light, small narrative details, effortless beauty, authentic posture and expression"
+  },
+  "AnalogFilmRealism": {
+    "name": "Analog Film Realism",
+    "category": "Photography",
+    "subcategory": "Realistic",
+    "content": "analog film realism, gentle film grain, organic color response, soft highlight rolloff, rich midtones, subtle halation, pleasing imperfect contrast, tactile chemical capture, emotional warmth, optical softness, retained detail"
+  },
+  "HyperrealPhotography": {
+    "name": "Hyperreal Photography",
+    "category": "Photography",
+    "subcategory": "Realistic",
+    "content": "hyperreal photography, heightened clarity, revealed microtexture, precise material response, detailed skin, atmospheric depth, exact tonal structure, exceptional definition, more vivid than ordinary sight, believable and coherent, free of plastic perfection"
+  },
+  "FineArtRealism": {
+    "name": "Fine Art Realism",
+    "category": "Photography",
+    "subcategory": "Realistic",
+    "content": "fine art realism, truthful anatomy and materials, deliberate balanced composition, emotional restraint, visual meaning, contemplative mood, beauty from form and atmosphere, quiet intent, gallery-quality finish"
+  },
+  "PainterlyPhotographicRealism": {
+    "name": "Painterly Photographic Realism",
+    "category": "Photography",
+    "subcategory": "Realistic",
+    "content": "painterly photographic realism, broad masses of light and shadow, controlled edges, layered color, selective detail, both captured and composed, real anatomy and texture, light simplifying forms into graceful shapes, emerging fine detail, painterly eye"
+  },
+  "ChiaroscuroRealism": {
+    "name": "Chiaroscuro Realism",
+    "category": "Photography",
+    "subcategory": "Realistic",
+    "content": "chiaroscuro realism, strong directional light, deep dimensional shadow, sculptural tonal contrast, dramatic revealed form, darkness concealing without erasing, structural highlights, tracing faces bodies and fabric, baroque light modeling"
+  },
+  "RomanticRealism": {
+    "name": "Romantic Realism",
+    "category": "Photography",
+    "subcategory": "Realistic",
+    "content": "romantic realism, believable detail and anatomy, lyrical light, graceful composition, rich atmosphere, emotionally resonant color, elevated by feeling and memory, tender mood, grounded in the physical world"
+  },
+  "AtmosphericRealism": {
+    "name": "Atmospheric Realism",
+    "category": "Photography",
+    "subcategory": "Realistic",
+    "content": "atmospheric realism, atmosphere as visible material, mist, dust, rain, smoke, humidity, reflected light, soft distance, layered depth, realistic subjects and environments, mood carried by air and light"
+  },
+  "SculpturalRealism": {
+    "name": "Sculptural Realism",
+    "category": "Photography",
+    "subcategory": "Realistic",
+    "content": "sculptural realism, directional light, clean silhouettes, controlled shadow, strong volumetric form, bodies carved by light, natural anatomy, weight and surface texture, spatial presence, calm monumental clarity"
+  },
+  "PoeticRealism": {
+    "name": "Poetic Realism",
+    "category": "Photography",
+    "subcategory": "Realistic",
+    "content": "poetic realism, believable people places and materials, expressive gesture, evocative light and color, visual metaphor, quiet emotional meaning, suggestive detail, restrained symbolism, ordinary moments that linger"
+  },
+  "SymbolicRealism": {
+    "name": "Symbolic Realism",
+    "category": "Photography",
+    "subcategory": "Realistic",
+    "content": "symbolic realism, coherent natural scene, objects pose architecture and color carrying symbolic weight, deliberate meaningful arrangement, symbolism through composition and association, grounded without fantasy effects"
+  },
+  "DramaticRealism": {
+    "name": "Dramatic Realism",
+    "category": "Photography",
+    "subcategory": "Realistic",
+    "content": "dramatic realism, decisive composition, directional light, strong tonal contrast, active weather or movement, emotionally charged spatial relationships, believable anatomy and materials, earned intensity, cinematic drama"
+  },
+  "MinimalistRealism": {
+    "name": "Minimalist Realism",
+    "category": "Photography",
+    "subcategory": "Realistic",
+    "content": "minimalist realism, essential forms, negative space, quiet geometry, restrained color, clean light, few carefully placed details, weighted composition, expressive silhouette and texture, calm clarity"
+  },
+  "TonalRealism": {
+    "name": "Tonal Realism",
+    "category": "Photography",
+    "subcategory": "Realistic",
+    "content": "tonal realism, nuanced tonal relationships, form from subtle brightness shifts, shadow temperature, reflected light, midtone density, soft edges over harsh outlines, natural color, realistic texture, calm unified rhythm"
+  },
+  "TexturalRealism": {
+    "name": "Textural Realism",
+    "category": "Photography",
+    "subcategory": "Realistic",
+    "content": "textural realism, texture-driven detail, skin stone fabric metal wood glass hair and dust, precise light interaction, tactile varied surfaces, palpable materials, weathered surface detail, controlled without visual noise"
+  },
+  "DreamlikeRealism": {
+    "name": "Dreamlike Realism",
+    "category": "Photography",
+    "subcategory": "Realistic",
+    "content": "dreamlike realism, physically believable scene, suspended time and atmosphere, soft transitions, selective clarity, gentle spatial ambiguity, emotionally charged color, coherent anatomy and objects, quiet stillness"
+  },
+  "NeoNoirRealism": {
+    "name": "Neo-Noir Realism",
+    "category": "Photography",
+    "subcategory": "Realistic",
+    "content": "neo-noir realism, darkness, practical light, reflective surfaces, narrow color accents, urban tension, controlled mystery, believable people and environments, fragments revealed by light, meaningful shadow, moody cinematic crime aesthetic"
+  },
+  "BoldColorRealism": {
+    "name": "Bold Color Realism",
+    "category": "Photography",
+    "subcategory": "Realistic",
+    "content": "bold color realism, realistic anatomy materials and lighting, deliberate bold color relationships, saturated accents, complementary tension, strong tonal blocks, mood-driven color, intensified reality, coherent scene without graphic flattening"
+  },
+  "FemalePortraitRealism": {
+    "name": "Female Portrait Realism",
+    "category": "Photography",
+    "subcategory": "Realistic - Female Figure",
+    "content": "truthful adult woman portrait, believable facial structure, natural proportions, expressive eyes, individual features, authentic skin texture, subtle asymmetry, character and presence, natural light, individual beauty over generic smoothing"
+  },
+  "NaturalSkinRealism": {
+    "name": "Natural Skin Realism",
+    "category": "Photography",
+    "subcategory": "Realistic - Female Figure",
+    "content": "natural adult female skin, living responsive texture, visible pores, fine skin detail, soft tonal variation, delicate veins where natural, faint lines, subtle marks, realistic matte-to-luminous transitions, warm skin depth, tactile un-retouched finish, authentic complexion"
+  },
+  "AnatomicalRealism": {
+    "name": "Anatomical Realism",
+    "category": "Photography",
+    "subcategory": "Realistic - Female Figure",
+    "content": "anatomically coherent adult female figure, unified skull neck shoulders ribcage spine pelvis and limbs, natural hands and feet, respected joint limits, believable muscle tension, gravity and balance, natural proportion, graceful without exaggerated waist hips breasts or limbs"
+  },
+  "GracefulFigureRealism": {
+    "name": "Graceful Figure Realism",
+    "category": "Photography",
+    "subcategory": "Realistic - Female Figure",
+    "content": "graceful adult female figure, natural proportion, quiet confidence, believable curves, balanced weight distribution, relaxed hands, coherent posture, flowing head-to-torso-to-legs line, inhabited and alive, natural rather than posed for display"
+  },
+  "NaturalFigureStudy": {
+    "name": "Natural Figure Study",
+    "category": "Photography",
+    "subcategory": "Realistic - Female Figure",
+    "content": "natural adult female figure study, clothed or nude, real anatomy, natural posture, authentic skin, gravity-true form, subtle asymmetry, natural breast shape, soft tissue behavior, artist's observational attention, quiet dignity"
+  },
+  "StudioFigureRealism": {
+    "name": "Studio Figure Realism",
+    "category": "Photography",
+    "subcategory": "Realistic - Female Figure",
+    "content": "refined studio study of the adult female figure, controlled light, clear face torso breasts waist pelvis and limbs, natural anatomy, restrained composition, elegant plausible pose, self-possessed mood, textured skin"
+  },
+  "FineArtFigureRealism": {
+    "name": "Fine Art Figure Realism",
+    "category": "Photography",
+    "subcategory": "Realistic - Female Figure",
+    "content": "fine art adult female figure, dignified composition, intentional form gesture and negative space, real breasts and natural curves, authentic skin texture, individual anatomy, balanced presence, sculptural light, beauty through form rather than display"
+  },
+  "ChiaroscuroFigureRealism": {
+    "name": "Chiaroscuro Figure Realism",
+    "category": "Photography",
+    "subcategory": "Realistic - Female Figure",
+    "content": "sculptural chiaroscuro on the adult female form, strong directional light, deep protective shadow, revealed face shoulders breasts ribcage waist hips and limbs, real anatomy, elegant posture, textured skin, powerful composition without theatrical sexualization"
+  },
+  "DocumentaryBodyRealism": {
+    "name": "Documentary Body Realism",
+    "category": "Photography",
+    "subcategory": "Realistic - Female Figure",
+    "content": "documentary honesty of the adult female body, natural posture, ordinary asymmetry, real skin, authentic proportions, unforced occupation of space, individuality over idealized glamour anatomy, lived presence, physical truth"
+  },
+  "MatureSkinRealism": {
+    "name": "Mature Skin Realism",
+    "category": "Photography",
+    "subcategory": "Realistic - Female Figure",
+    "content": "mature adult woman, age-consistent beauty, truthful skin, fine lines, natural texture, softness, changing facial planes, natural body form, dignity of experience, preserved individuality, natural un-smoothed complexion"
+  },
+  "SoftEditorialFigureRealism": {
+    "name": "Soft Editorial Figure Realism",
+    "category": "Photography",
+    "subcategory": "Realistic - Female Figure",
+    "content": "soft editorial adult female figure, elegant composition, refined soft light, natural skin, graceful posture, coherent proportions, understated styling, clothed or nude, poised self-possessed presence, natural proportion without exaggeration"
+  },
+  "SculpturalBodyRealism": {
+    "name": "Sculptural Body Realism",
+    "category": "Photography",
+    "subcategory": "Realistic - Female Figure",
+    "content": "adult female body as living sculpture, shaped by light gravity bone muscle and soft tissue, coherent volume, natural breast weight, ribcage-to-pelvis relationship, flowing limbs through space, warm human textured skin, natural rather than marble-smooth"
+  },
+  "MovementAndPostureRealism": {
+    "name": "Movement and Posture Realism",
+    "category": "Photography",
+    "subcategory": "Realistic - Female Figure",
+    "content": "believable adult female movement and posture, balance traveling through feet legs pelvis spine shoulders neck and head, realistic muscle engagement, natural fabric and skin response, physically possible elegant gesture, connected whole-body motion"
+  },
+  "IntimateNaturalRealism": {
+    "name": "Intimate Natural Realism",
+    "category": "Photography",
+    "subcategory": "Realistic - Female Figure",
+    "content": "quiet intimate adult woman, natural close light, authentic skin, relaxed posture, subtle expression, respectful framing, warmth and vulnerability, natural sensuality from atmosphere and presence, natural anatomy without provocative posing"
+  },
+  "ClassicalFemaleFormRealism": {
+    "name": "Classical Female Form Realism",
+    "category": "Photography",
+    "subcategory": "Realistic - Female Figure",
+    "content": "adult female figure in balanced classical form, fully human and anatomically real, harmonious proportion, calm posture, graceful contour, natural breasts, authentic skin, composed light, whole-person dignity, timeless presence"
+  }
+}

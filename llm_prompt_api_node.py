@@ -1,0 +1,2784 @@
+"""Luna-LLMPromptAPI — ComfyUI node for prompt generation via remote/local OpenAI-compatible endpoints.
+
+Supported providers:
+  - Gemini (Google) — native API, default provider
+  - Grok (xAI)
+  - Custom (arbitrary OpenAI-compatible endpoint)
+
+Design principles:
+  - No GGUF loading, no chat template hell, no KV cache mgmt — the upstream
+    server handles all of that.
+  - Live-query /v1/models when possible (Gemini, Custom).
+  - Grok has no /models endpoint per docs, so we keep a small curated list.
+  - Per-provider parameter sanitization — strip params the provider rejects.
+  - Cache-friendly prompt assembly: stable parts (style, canvas) first,
+    variable parts (user_prompt) last, so prompt-caching prefix matches.
+  - Forced JSON mode at the API level when output_format=json.
+  - Gemini-specific features (thinking_budget, cached_content, safety) routed
+    via extra_body in the OpenAI-compat layer.
+"""
+
+from __future__ import annotations
+
+import hashlib
+from contextlib import nullcontext
+import json
+import os
+import re
+import threading
+import time
+import urllib.request
+import urllib.error
+from pathlib import Path
+from typing import Any
+
+# Reuse helpers from the sister GGUF node
+from .llm_prompt_node import (
+    load_system_prompts,
+    _build_canvas_profile,
+    _tensor_to_base64_png,
+    _sample_video_frames,
+    _resolve_model_settings,
+)
+from .output_cleaner import OutputCleanConfig, clean_model_output, normalize_prompt_separator, split_positive_negative
+from .h3_validate import validate_h3, format_log
+from .gemini_video import gemini_video_part
+from comfy_api.latest import io
+
+
+# ---------------------------------------------------------------------------
+# Provider configuration
+# ---------------------------------------------------------------------------
+
+PROVIDERS = {
+    "Gemini": {
+        # NATIVE Gemini REST API — NOT the OpenAI-compat layer. The compat layer
+        # silently drops Gemini-specific params (thinking_budget, safety, top_k),
+        # and rejects `seed` and `extra_body` at the HTTP level. Going native
+        # gives us full feature support and matches Luna Core's approach.
+        "base_url": "https://generativelanguage.googleapis.com/v1beta",
+        "env_var": ["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GEMINI_API_KEY"],
+        "needs_auth": True,
+        "live_models": True,
+        "native_protocol": "gemini",  # routes to _send_gemini_native()
+        # Last-resort fallback when /models fails (e.g. no API key set yet).
+        # Current Gemini API models as of late 2025 / early 2026 — verified
+        # against https://ai.google.dev/gemini-api/docs/models. Once an API key
+        # is set, the live query returns the user's full account-accessible list.
+        "fallback_models": [
+            # Gemini 3 series (current). 3.8-flash added 2026-10-04 from a
+            # live ListModels pass. Removed 2026-10-12 (served by newer models
+            # when asked): 3.7-flash -> 3.8-flash, 3.5-flash -> 3.6-flash,
+            # 3.1-flash-lite-preview -> 3.1-flash-lite.
+            "gemini-3.8-flash",
+            "gemini-3.6-flash",
+            "gemini-3.1-pro-preview",
+            "gemini-3.5-flash-lite",
+            "gemini-3-flash-preview",
+            "gemini-3.1-flash-lite",
+            # Rolling aliases — never go stale.
+            "gemini-pro-latest",
+            "gemini-flash-latest",
+            "gemini-flash-lite-latest",
+            # The gemini-2.5-* entries were REMOVED 2026-08-31. ListModels still
+            # advertises them, but generateContent 404s: "This model is no longer
+            # available to new users." Verified on a live key for 2.5-pro,
+            # 2.5-flash AND 2.5-flash-lite. Every 3.x above was confirmed
+            # callable in the same pass. Do not restore them from the model list
+            # alone — being listed does not mean being callable.
+        ],
+    },
+    "Grok (xAI)": {
+        "base_url": "https://api.x.ai/v1",
+        "env_var": ["XAI_API_KEY", "GROK_API_KEY"],
+        "needs_auth": True,
+        # xAI exposes an OpenAI-compatible GET /v1/models (Bearer auth), so we
+        # live-query it just like any other OpenAI-compat provider. The curated
+        # list below is only the no-key / offline fallback.
+        "live_models": True,
+        "fallback_models": [
+            "grok-4.7",
+            "grok-4.6",
+            "grok-4.5",
+            "grok-4.3",
+            "grok-4.20-multi-agent-0309",
+            "grok-4.20-0309-reasoning",
+            "grok-4.20-0309-non-reasoning",
+            "grok-build-0.1",
+        ],
+    },
+    "OpenAI": {
+        # Standard OpenAI Chat Completions. NOT the Responses API — OpenAI now
+        # recommends Responses for reasoning models, but Chat Completions is
+        # still supported and is the protocol this node already speaks.
+        "base_url": "https://api.openai.com/v1",
+        "env_var": ["OPENAI_API_KEY"],
+        "needs_auth": True,
+        # OpenAI exposes GET /v1/models with Bearer auth, same as xAI.
+        "live_models": True,
+        # Whitelist applied to the LIVE list too, not just the fallback. The
+        # /v1/models query returns ~124 models — a decade of legacy 3.5/4/4o/o1
+        # plus every dated snapshot — and Peti uses only the 5.6 family
+        # (2026-08-31). Widen this regex to admit a new family; there is no
+        # widget for it on purpose, because a dropdown of 124 models is worse
+        # than editing one line when 5.7 ships.
+        # Widened 2026-10-04 to admit the GPT-6 family (gpt-6-sol / -luna /
+        # -astra, gpt-6.1-sol), which appeared on the live list.
+        "model_pattern": r"^gpt-(5\.6|6)",
+        # No-key fallback only.
+        "fallback_models": [
+            "gpt-6.1-sol",
+            "gpt-6-sol",
+            "gpt-6-luna",
+            "gpt-6-astra",
+            "gpt-5.6-sol",    # highest quality
+            "gpt-5.6-terra",  # mid
+            "gpt-5.6-luna",   # cheapest / fastest
+        ],
+    },
+    # Local models through LM Studio's own REST API (Peter, 2026-10-12: "Lm studio
+    # is used for Local Models in Luna Bridge Claude so the server is ok, we can
+    # use a function LM Studio has to unload the model"). Native /api/v1, not
+    # the OpenAI-compatible /v1: it reports load state, reasoning options and
+    # whether a request loaded the model, which the unload rule needs.
+    "LM Studio": {
+        # 127.0.0.1, not localhost: Python on Windows tries IPv6 ::1 first and
+        # waits ~2 s for the refusal before IPv4 (MEASURED 2026-10-19: 2.06 s vs 0.02 s).
+        "base_url": "http://127.0.0.1:1234",
+        "env_var": ["LM_API_TOKEN"],  # only when the server requires a token
+        "needs_auth": False,
+        "live_models": True,
+        "native_protocol": "lmstudio",
+        "fallback_models": ["<start LM Studio's server and refresh>"],
+    },
+    # ---- Subscription routes (Peter, 2026-10-04: "not on API but on my Max
+    # sub", "do the same for codex", "and Grok sub cli"). Each runs the
+    # vendor's own CLI headless on its stored login - the sanctioned way to use
+    # a subscription from a program; the node never reads or stores a token.
+    # They spend that subscription's quota (shared with interactive sessions)
+    # and pay a CLI start-up of several seconds per call. No sampling controls;
+    # reasoning_effort maps to each CLI's own effort flag. All three were
+    # live-tested with text and an image on 2026-10-04.
+    "Claude (Max)": {
+        # `claude -p`; preset via --system-prompt-file (no length limit);
+        # images as base64 blocks through --input-format stream-json.
+        "base_url": "",
+        "env_var": None,
+        "needs_auth": False,
+        "live_models": False,
+        "native_protocol": "claude_cli",
+        "fallback_models": [
+            "claude-sonnet-5-5",
+            "claude-opus-5-5",
+            "claude-fable-5-1",
+            "claude-haiku-4-5",
+        ],
+    },
+    "Codex (ChatGPT)": {
+        # `codex exec`; prompt on stdin, images as temp PNGs via -i, read-only
+        # sandbox. gpt-6-astra left out on purpose: it empties the ChatGPT
+        # quota in a few turns (agent-fleet rule, Peter 2026-09-19).
+        "base_url": "",
+        "env_var": None,
+        "needs_auth": False,
+        "live_models": False,
+        "native_protocol": "codex_cli",
+        "fallback_models": [
+            "gpt-6-luna",
+            "gpt-6-sol",
+            "gpt-6.1-sol",
+            "gpt-5.6-luna",
+            "gpt-5.6-terra",
+            "gpt-5.6-sol",
+        ],
+    },
+    "Grok (SuperGrok)": {
+        # `grok` CLI with XAI_API_KEY / GROK_API_KEY removed from ITS process
+        # only - otherwise it bills the API key instead of the grok.com login.
+        # Images go in as ACP blocks on the command line, so they are
+        # downscaled to fit Windows' ~32k-character limit.
+        "base_url": "",
+        "env_var": None,
+        "needs_auth": False,
+        "live_models": False,
+        "native_protocol": "grok_cli",
+        "fallback_models": [
+            "grok-4.7",
+            "grok-4.7-build-fast",
+            "grok-4.6",
+            "grok-4.5",
+        ],
+    },
+    "Gemini (Antigravity)": {
+        # `agy` (Antigravity CLI) on Peter's Gemini login (Peter, 2026-10-12:
+        # "yes"). The npm `gemini` CLI has no login on this machine. agy has
+        # no stdin prompt, so the request goes in prompt.md in a throwaway
+        # folder with the images and audio, and agy runs in read-only plan
+        # mode. Its models carry the reasoning level in the name
+        # (gemini-3.8-flash-low); the node appends it. Takes audio (TESTED).
+        "base_url": "",
+        "env_var": None,
+        "needs_auth": False,
+        "live_models": False,
+        "native_protocol": "agy_cli",
+        "fallback_models": [
+            "gemini-3.8-flash",
+            "gemini-3.6-flash",
+            "gemini-3.1-pro",
+        ],
+    },
+    "Custom": {
+        "base_url": "",  # user supplies via the server_url widget
+        "env_var": None,
+        "needs_auth": False,
+        "live_models": True,
+        "fallback_models": ["<set server_url and refresh>"],
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# Quality levels (plans/api-node-ui.md). A level sets only the reasoning level
+# sent to the provider; sampling stays as auto_settings / the sliders decide.
+# "custom" leaves every widget as it is. Values checked live 2026-10-12:
+# Gemini 3.8-flash and 3.1-pro reject thinking_level "minimal" (the sender
+# falls back to "low"); Grok 4.5-4.7 accept low..xhigh and reject "none".
+# ---------------------------------------------------------------------------
+
+QUALITY_OPTIONS = ["fast", "normal", "quality", "ultra", "custom"]
+_QUALITY_INDEX = {"fast": 0, "normal": 1, "quality": 2, "ultra": 3}
+_QUALITY_EFFORTS = {
+    "gemini": ("minimal", "low", "medium", "high"),
+    "Grok (xAI)": ("low", "medium", "high", "xhigh"),
+    "OpenAI": ("none", "low", "medium", "high"),
+    "Claude (Max)": ("low", "medium", "high", "xhigh"),
+    "Codex (ChatGPT)": ("low", "medium", "high", "xhigh"),
+    "Grok (SuperGrok)": ("low", "medium", "high", "xhigh"),
+    # LM Studio models with only off / on get "on" for the three thinking
+    # levels (the sender maps it from the model's own options).
+    "LM Studio": ("off", "low", "medium", "high"),
+    "Gemini (Antigravity)": ("low", "medium", "high", "high"),
+}
+
+
+# Gemini models that reject thinking_level "minimal" (live 2026-10-12, plus the
+# names Google routes to them). The sender adds any model it finds at run time.
+_GEMINI_NO_MINIMAL = {"gemini-3.8-flash", "gemini-3.7-flash", "gemini-flash-latest",
+                      "gemini-3.1-pro-preview", "gemini-3.1-pro-preview-customtools",
+                      "gemini-pro-latest"}
+
+
+def _quality_settings(provider: str, model_name: str, quality: str) -> dict | None:
+    """What a quality level overrides for this provider and model.
+
+    None = "custom" (keep the widgets). {} = the level has nothing to set here
+    (Gemma, an unknown Custom server). Otherwise one of `reasoning_effort` /
+    `gemini_thinking_level`.
+    """
+    idx = _QUALITY_INDEX.get((quality or "custom").lower())
+    if idx is None:
+        return None
+    cfg = PROVIDERS.get(provider) or {}
+    name = (model_name or "").lower()
+    if cfg.get("native_protocol") == "gemini":
+        if "gemma" in name:
+            return {}
+        # A model without "minimal" would run Fast and Normal both at "low";
+        # shift up instead: low / medium / high / high.
+        levels = _QUALITY_EFFORTS["gemini"]
+        if name in _GEMINI_NO_MINIMAL:
+            levels = levels[1:] + levels[-1:]
+        return {"gemini_thinking_level": levels[idx]}
+    efforts = _QUALITY_EFFORTS.get(provider)
+    return {"reasoning_effort": efforts[idx]} if efforts else {}
+
+
+# Last-run figures for the node face (time, tokens, served model, reasoning).
+# Each sender fills it; write_prompt_api clears it first. ComfyUI runs one
+# prompt at a time, the thread-local only keeps luna_writer_api callers apart.
+_RUN = threading.local()
+
+
+def _run_stats() -> dict:
+    stats = getattr(_RUN, "stats", None)
+    if stats is None:
+        stats = _RUN.stats = {}
+    return stats
+
+
+def _note_run(**fields) -> None:
+    _run_stats().update({k: v for k, v in fields.items() if v not in (None, "")})
+
+
+# Patterns to identify NON-chat models we should hide from the dropdown
+# (embeddings, image-gen, video-gen, TTS, STT — they aren't useful here).
+_NON_CHAT_PATTERNS = re.compile(
+    r"(embed|whisper|tts|audio|imagen|image-gen|dall-e|dalle|gpt-image|veo|omni|"
+    r"video-gen|imagine-image|imagine-video|moderation|search|grounding|sora|"
+    # OpenAI-specific noise: agentic/codex endpoints, realtime + transcription
+    # sockets, and the ancient base-completion models (davinci/babbage) which
+    # are not chat models at all.
+    r"realtime|transcribe|codex|davinci|babbage|instruct|"
+    # Gemini agent/robotics endpoints on the same key (2026-10-04 ListModels):
+    # generateContent, but not prompt-writing models.
+    r"robotics|computer-use)",
+    re.IGNORECASE,
+)
+
+# Per-provider name patterns that indicate vision capability.
+# Used when the /models response doesn't include a structured modality field.
+_VISION_PATTERNS = re.compile(
+    r"(vision|vl|multimodal|gemini|gpt-4o|gpt-4-turbo|gpt-4\.|grok-4|grok-2-vision|"
+    r"o1|o3|claude-3|llava|moondream|cogvlm|qwen.?vl|qwen2.?5.?vl|qwen3.?vl|"
+    r"intern.?vl|pixtral|paligemma|gemma)",
+    re.IGNORECASE,
+)
+
+# Pattern for explicit multimodal hint (video / audio input beyond just images).
+_MULTIMODAL_PATTERNS = re.compile(
+    r"(multimodal|gemini-2|gemini-3|gpt-4o-audio|video|audio.?input)",
+    re.IGNORECASE,
+)
+
+
+def _classify_capability(model_id: str, modality_hint: str = "") -> str:
+    """Classify a model as 'text', 'vision', or 'multimodal'.
+
+    modality_hint can be passed by OpenRouter-style metadata (e.g.
+    'text+image+video->text'). When given, that field takes priority.
+    """
+    if modality_hint:
+        m = modality_hint.lower()
+        modality_count = sum(1 for token in ("image", "video", "audio") if token in m)
+        if modality_count >= 2:
+            return "multimodal"
+        if "image" in m or "vision" in m:
+            return "vision"
+        return "text"
+
+    name = model_id.lower()
+    if _MULTIMODAL_PATTERNS.search(name):
+        return "multimodal"
+    if _VISION_PATTERNS.search(name):
+        return "vision"
+    return "text"
+
+
+# Cache (provider, base_url) -> list of model name strings.
+_MODEL_LIST_CACHE: dict[tuple[str, str], list[str]] = {}
+_MODEL_LIST_CACHE_TS: dict[tuple[str, str], float] = {}
+_MODEL_CACHE_TTL_SECONDS = 60
+
+
+def _fetch_models_from_server(base_url: str, api_key: str | None, native: str = "") -> list[str]:
+    """Query the models endpoint. Returns the list of model id strings.
+
+    For most providers (OpenAI-compatible), hits `<base>/models` with optional
+    Bearer auth and expects `{"data": [{"id": ...}]}`.
+
+    For Gemini native, hits `<base>/models?key=<api_key>` and expects
+    `{"models": [{"name": "models/gemini-..."}]}`.
+
+    Silently returns [] on any failure.
+    """
+    if not base_url:
+        return []
+    if native == "lmstudio":
+        return [m["key"] for m in _lmstudio_models(base_url, api_key) if m.get("type") == "llm"]
+    try:
+        if native == "gemini":
+            # Native Gemini models endpoint
+            if not api_key:
+                return []
+            # Key in the x-goog-api-key HEADER, not `?key=` — the legacy query
+            # form is undocumented for Google's service-account-bound auth keys,
+            # which are the only kind the API accepts from September 2026.
+            url = f"{base_url.rstrip('/')}/models"
+            req = urllib.request.Request(url, method="GET")
+            req.add_header("x-goog-api-key", api_key)
+        else:
+            url = base_url.rstrip("/") + "/models"
+            req = urllib.request.Request(url, method="GET")
+            if api_key:
+                req.add_header("Authorization", f"Bearer {api_key}")
+
+        with urllib.request.urlopen(req, timeout=3.0) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, TimeoutError):
+        return []
+    except Exception:
+        return []
+
+    if not isinstance(payload, dict):
+        return []
+
+    names: list[str] = []
+    if native == "gemini":
+        # Gemini's native REST returns: {"models": [{"name": "models/gemini-2.5-flash", "supportedGenerationMethods": [...]}, ...]}
+        for entry in payload.get("models") or []:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name") or ""
+            if name.startswith("models/"):
+                name = name[len("models/"):]
+            # Google serves more than the gemini-* family on this key: Gemma
+            # (gemma-3-27b-it and friends) and LearnLM are chat models on the
+            # same endpoint. The supportedGenerationMethods check below is the
+            # real filter — this prefix list only keeps out obvious non-chat
+            # families, so it must not be narrowed back to "gemini-" alone.
+            if not name.startswith(("gemini-", "gemma-", "learnlm-")):
+                continue
+            # Skip non-chat methods (embeddings, tuning, etc.)
+            methods = entry.get("supportedGenerationMethods") or []
+            if methods and "generateContent" not in methods:
+                continue
+            # Skip image-gen / video-gen variants — they're not for chat
+            if "-image" in name or name.startswith("imagen") or name.startswith("veo"):
+                continue
+            names.append(name)
+    else:
+        # OpenAI-compatible format
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, list):
+            return []
+        for entry in data:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("id") or entry.get("name")
+            if isinstance(name, str) and name:
+                names.append(name)
+    return names
+
+
+def _lmstudio_base(base_url: str) -> str:
+    """LM Studio's root URL; a pasted OpenAI-style .../v1 address is accepted too."""
+    base = (base_url or PROVIDERS["LM Studio"]["base_url"]).rstrip("/")
+    # A typed or saved localhost address gets the same IPv4 shortcut.
+    base = re.sub(r"^(https?://)localhost(?=[:/]|$)", r"\g<1>127.0.0.1", base, flags=re.I)
+    return base[:-3] if base.endswith("/v1") else base
+
+
+def _lmstudio_request(base_url: str, path: str, api_key: str | None, body: dict | None = None,
+                      timeout: float = 5.0) -> dict:
+    url = _lmstudio_base(base_url) + path
+    req = urllib.request.Request(url, data=json.dumps(body).encode() if body is not None else None,
+                                 method="POST" if body is not None else "GET")
+    req.add_header("Content-Type", "application/json")
+    if api_key:
+        req.add_header("Authorization", f"Bearer {api_key}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            msg = e.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            msg = ""
+        raise RuntimeError(f"LM Studio HTTP {e.code} on {path}: {msg or e.reason}") from None
+    except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
+        raise RuntimeError(
+            f"LM Studio's server does not answer at {_lmstudio_base(base_url)} ({getattr(e, 'reason', e)}). "
+            f"Start it in LM Studio (Developer > Start server) or run `lms server start`.") from None
+
+
+def _lmstudio_models(base_url: str, api_key: str | None = None) -> list[dict]:
+    """GET /api/v1/models; [] when the server is not running. The keys of the
+    last answer are kept on disk so a model picked while LM Studio was down at
+    ComfyUI start still passes validation."""
+    try:
+        models = _lmstudio_request(base_url, "/api/v1/models", api_key, timeout=3.0).get("models") or []
+    except Exception:
+        return []
+    keys = sorted(m["key"] for m in models if m.get("type") == "llm" and m.get("key"))
+    if keys and _check_load().get("_lmstudio", {}).get("models") != keys:
+        with _model_check_lock:
+            data = _check_load()
+            data["_lmstudio"] = {"models": keys, "at": time.time()}
+            try:
+                _MODEL_CHECK_FILE.write_text(json.dumps(data, indent=1, sort_keys=True), encoding="utf-8")
+            except Exception:
+                pass
+    return models
+
+
+def _apply_model_pattern(provider: str, models: list[str]) -> list[str]:
+    """Keep only the models a provider's `model_pattern` admits.
+
+    Used by BOTH the dropdown route and the schema's validation superset, so
+    the two can never disagree about what is selectable. Providers with no
+    `model_pattern` are returned untouched. If the pattern matches nothing
+    (a family rename), the unfiltered list is returned rather than an empty
+    dropdown — a wrong list beats no list.
+    """
+    pattern = (PROVIDERS.get(provider) or {}).get("model_pattern")
+    if not pattern:
+        return models
+    keep = [m for m in models if re.search(pattern, m, re.IGNORECASE)]
+    if not keep:
+        print(f"[Luna-LLMPromptAPI] {provider}: model_pattern {pattern!r} matched "
+              f"nothing in {len(models)} models — showing the unfiltered list.")
+        return models
+    return keep
+
+
+# ---------------------------------------------------------------------------
+# Gemini model check (Peter, 2026-10-12: "check the curent models and have the
+# node refresh them"). ListModels keeps advertising retired models: on
+# 2026-10-12 the three gemini-2.5 models 404'd and gemini-3.7-flash /
+# 3.5-flash / 3.1-flash-lite-preview were silently served by newer models.
+# One tiny call per model tells them apart; the result is cached in a
+# git-ignored file and dead or rerouted models leave the dropdown. A real run
+# that comes back from another model marks it rerouted for free.
+# ---------------------------------------------------------------------------
+
+_MODEL_CHECK_FILE = Path(__file__).resolve().parent / ".api_models_check.json"
+_MODEL_CHECK_MAX_AGE = 7 * 24 * 3600
+_model_check_lock = threading.Lock()
+
+
+def _check_load() -> dict:
+    try:
+        data = json.loads(_MODEL_CHECK_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _check_record(model: str, status: str, served: str = "", note: str = "") -> None:
+    with _model_check_lock:
+        data = _check_load()
+        data[model] = {"status": status, "served": served, "note": note[:200], "at": time.time()}
+        try:
+            _MODEL_CHECK_FILE.write_text(json.dumps(data, indent=1, sort_keys=True), encoding="utf-8")
+        except Exception as e:
+            print(f"[Luna-LLMPromptAPI] could not write the model check file: {e}")
+
+
+def _note_served_model(model: str, served: str) -> None:
+    """A run answered by another model: the asked one is retired and rerouted."""
+    if not served or not model or model.endswith("-latest"):
+        return
+    if served.lower() != model.lower() and not served.lower().startswith(model.lower() + "-"):
+        print(f"[Luna-LLMPromptAPI] {model} is now served by {served}; hiding it from the list.")
+        _check_record(model, "routed", served=served)
+
+
+def _probe_gemini_model(api_key: str, model: str) -> tuple[str, str, str] | None:
+    """(status, served, note) from one tiny text call; None when the result says nothing."""
+    body = json.dumps({"contents": [{"parts": [{"text": "Say OK"}]}],
+                       "generationConfig": {"maxOutputTokens": 16, "responseModalities": ["TEXT"]}}).encode()
+    req = urllib.request.Request(
+        f"{PROVIDERS['Gemini']['base_url']}/models/{model}:generateContent", data=body,
+        headers={"Content-Type": "application/json", "x-goog-api-key": api_key})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            served = json.load(r).get("modelVersion") or model
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.load(e).get("error", {}).get("message", "")
+        except Exception:
+            msg = ""
+        if e.code == 404:
+            return "dead", "", msg
+        return None  # 429 / 5xx / 400: says nothing about the model itself
+    except Exception:
+        return None
+    if model.endswith("-latest") or served.lower() == model.lower():
+        return "ok", served, ""
+    return "routed", served, ""
+
+
+def _check_gemini_models(models: list[str], force: bool = False) -> int:
+    """Probe the models without a fresh check (all of them when force). Returns calls made."""
+    api_key = _resolve_api_key("Gemini")
+    if not api_key:
+        return 0
+    # One check at a time: a node load fires two list requests back to back.
+    if not _check_running.acquire(blocking=force):
+        return 0
+    try:
+        return _check_gemini_models_locked(api_key, models, force)
+    finally:
+        _check_running.release()
+
+
+_check_running = threading.Lock()
+
+
+def _check_gemini_models_locked(api_key: str, models: list[str], force: bool) -> int:
+    known = _check_load()
+    now = time.time()
+    todo = [m for m in models if force or now - float((known.get(m) or {}).get("at") or 0) > _MODEL_CHECK_MAX_AGE]
+    if not todo:
+        return 0
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(lambda m: (m, _probe_gemini_model(api_key, m)), todo))
+    summary = []
+    for m, res in results:
+        if res:
+            _check_record(m, *res)
+            if res[0] != "ok":
+                summary.append(f"{m} {res[0]}" + (f" -> {res[1]}" if res[1] else ""))
+    print(f"[Luna-LLMPromptAPI] Gemini model check: {len(todo)} model(s) probed"
+          + (f"; hidden: {', '.join(summary)}" if summary else "; all answer"))
+    return len(todo)
+
+
+def _gemini_sort_key(model: str):
+    """Newest Gemini first, then the -latest aliases, then Gemma."""
+    m = model.lower()
+    nums = re.findall(r"\d+(?:\.\d+)?", m.split("-", 2)[1] if m.count("-") else m)
+    version = -float(nums[0]) if nums else 0.0
+    group = 2 if m.startswith("gemma") else (1 if m.endswith("-latest") else 0)
+    return (group, version, "pro" not in m, "lite" in m, m)
+
+
+def _gemini_hidden_models() -> dict[str, dict]:
+    return {m: v for m, v in _check_load().items() if (v or {}).get("status") in ("dead", "routed")}
+
+
+def _get_models_for_provider(
+    provider: str,
+    custom_url: str = "",
+    api_key_override: str = "",
+) -> list[str]:
+    """Live-query the provider's /v1/models (or use the curated fallback).
+
+    Filters out non-chat models (embeddings, image-gen, TTS, etc.) before
+    returning. Capability-level filtering (vision/multimodal/text-only) is
+    done at the dropdown rendering step by the JS extension.
+    """
+    cfg = PROVIDERS.get(provider)
+    if not cfg:
+        return ["<unknown provider>"]
+
+    base_url = custom_url.strip() if provider == "Custom" else cfg["base_url"]
+    cache_key = (provider, base_url)
+    now = time.time()
+    cached_ts = _MODEL_LIST_CACHE_TS.get(cache_key, 0)
+    if (now - cached_ts) < _MODEL_CACHE_TTL_SECONDS:
+        cached = _MODEL_LIST_CACHE.get(cache_key)
+        if cached:
+            return cached
+
+    api_key = _resolve_api_key(provider, api_key_override)
+
+    raw_models: list[str] = []
+    if cfg.get("live_models") and base_url:
+        raw_models = _fetch_models_from_server(base_url, api_key, cfg.get("native_protocol", ""))
+
+    if not raw_models:
+        raw_models = list(cfg.get("fallback_models") or [])
+
+    # Filter out non-chat models (embeddings, image-gen, TTS, etc.). LM Studio
+    # already lists only its LLMs, and local names often carry "instruct".
+    filtered = (list(raw_models) if cfg.get("native_protocol") == "lmstudio"
+                else [m for m in raw_models if not _NON_CHAT_PATTERNS.search(m)])
+    if not filtered:
+        # If the filter ate everything (rare), keep the raw list so user can see something
+        filtered = raw_models
+
+    # Per-provider whitelist (OpenAI keeps only the GPT-5.6 family).
+    filtered = _apply_model_pattern(provider, filtered)
+
+    if cfg.get("native_protocol") == "gemini":
+        # Image models answer generateContent too (gemini-nano-banana-2.1 got
+        # through on 2026-10-12); they belong to the Luna-GeminiImage node.
+        filtered = [m for m in filtered if "banana" not in m and "-image" not in m]
+        # Models the check found dead or rerouted stay out of the list.
+        hidden = _gemini_hidden_models()
+        filtered = [m for m in filtered if m not in hidden] or filtered
+        filtered.sort(key=_gemini_sort_key)
+
+    # Sort: keep stable order from the API, just dedupe
+    seen = set()
+    deduped = []
+    for m in filtered:
+        if m not in seen:
+            seen.add(m)
+            deduped.append(m)
+
+    _MODEL_LIST_CACHE[cache_key] = deduped
+    _MODEL_LIST_CACHE_TS[cache_key] = now
+    return deduped
+
+
+# The validation superset's live part. ComfyUI rebuilds the node schema on every
+# queue: once to validate, once per linked input, once to read the inputs. Each
+# build live-queried every provider (MEASURED 2026-10-19: 3.3-3.8 s per build),
+# so a run waited many seconds before its own API call.
+_SCHEMA_MODELS: list[str] | None = None
+_schema_models_lock = threading.Lock()
+
+
+def _fetch_schema_live_models() -> list[str]:
+    """Live-query each provider that has a URL and, where needed, a key."""
+    models: list[str] = []
+    for prov_name, prov_cfg in PROVIDERS.items():
+        base = prov_cfg.get("base_url") or ""
+        if not prov_cfg.get("live_models") or not base:
+            continue  # Custom has no URL until the user fills in the widget
+        key = _resolve_api_key(prov_name, "")
+        if prov_cfg.get("needs_auth") and not key:
+            continue
+        try:
+            live = _fetch_models_from_server(base, key, prov_cfg.get("native_protocol", ""))
+            # Same whitelist the dropdown route applies, so the validation
+            # superset and the visible list agree.
+            models.extend(_apply_model_pattern(prov_name, live))
+        except Exception:
+            pass
+    return models
+
+
+def _schema_live_models() -> list[str]:
+    """The live lists fetched once at the first build, plus every list the dropdown route has shown.
+
+    No timed refresh (Peter, 2026-10-19: "providers dont release new models so
+    often"). A new model reaches validation through the dropdown, which loads
+    its list on node add, workflow open, provider change and the refresh button.
+    """
+    global _SCHEMA_MODELS
+    if _SCHEMA_MODELS is None:
+        with _schema_models_lock:
+            if _SCHEMA_MODELS is None:
+                _SCHEMA_MODELS = _fetch_schema_live_models()
+    models = list(_SCHEMA_MODELS)
+    for listed in list(_MODEL_LIST_CACHE.values()):
+        models.extend(listed)
+    return models
+
+
+# ---------------------------------------------------------------------------
+# Server route: let the browser fetch the LIVE per-provider model list.
+#
+# The browser never holds the API keys (they live in env / .env on the ComfyUI
+# server), so the client-side JS cannot query Gemini/Grok directly. Instead the
+# JS calls this route; the SERVER runs _get_models_for_provider() with the
+# resolved credentials and returns the current list. This is what makes the
+# dropdown auto-populate with new models the moment a provider ships them —
+# no hardcoded list to keep in sync.
+# ---------------------------------------------------------------------------
+try:
+    from server import PromptServer
+    from aiohttp import web as _aiohttp_web
+
+    @PromptServer.instance.routes.get("/llm_prompt_api/models")
+    async def _llm_prompt_api_models_route(request):
+        provider = request.query.get("provider", "")
+        server_url = request.query.get("server_url", "")
+        # refresh=1 (the ↻ on the node face): drop the cached list and, for
+        # Gemini, re-check every listed model (~20 tiny calls, < $0.01).
+        refresh = request.query.get("refresh") == "1"
+        try:
+            import asyncio
+            loop = asyncio.get_running_loop()
+            cfg = PROVIDERS.get(provider) or {}
+            base = server_url.strip() if provider == "Custom" else cfg.get("base_url", "")
+            if refresh:
+                _MODEL_LIST_CACHE_TS.pop((provider, base), None)
+            if cfg.get("native_protocol") == "gemini":
+                # The check needs the unfiltered list, so it is fetched raw here.
+                raw = await loop.run_in_executor(None, lambda: _fetch_models_from_server(
+                    cfg["base_url"], _resolve_api_key("Gemini"), "gemini"))
+                raw = [m for m in raw if "banana" not in m and "-image" not in m
+                       and not _NON_CHAT_PATTERNS.search(m)]
+                if refresh:
+                    await loop.run_in_executor(None, _check_gemini_models, raw, True)
+                else:
+                    # New or stale models only, in the background: the list
+                    # answers now, the next refresh sees the result.
+                    threading.Thread(target=_check_gemini_models, args=(raw,), daemon=True).start()
+                _MODEL_LIST_CACHE_TS.pop((provider, base), None)
+            models = await loop.run_in_executor(None, _get_models_for_provider, provider, server_url)
+        except Exception as exc:  # never 500 the frontend — degrade to fallback
+            return _aiohttp_web.json_response(
+                {"provider": provider, "models": [], "error": str(exc)}
+            )
+        hidden = _gemini_hidden_models() if provider == "Gemini" else {}
+        return _aiohttp_web.json_response({"provider": provider, "models": models, "hidden": hidden})
+    @PromptServer.instance.routes.get("/llm_prompt_api/model_info")
+    async def _llm_prompt_api_model_info_route(request):
+        import asyncio
+        q = request.query
+        try:
+            info = await asyncio.get_running_loop().run_in_executor(
+                None, _model_info, q.get("provider", ""), q.get("model", ""), q.get("server_url", ""))
+        except Exception as exc:
+            info = {"error": str(exc)}
+        return _aiohttp_web.json_response(info)
+except Exception as _route_exc:  # pragma: no cover — server unavailable at import
+    print(f"[Luna-LLMPromptAPI] model-list route not registered: {_route_exc}")
+
+
+# ---------------------------------------------------------------------------
+# Node face data: provider status dots, model badges, the quality cards'
+# labels. One source of truth with the run (_quality_settings), so a card
+# never promises a level the run would not send.
+# ---------------------------------------------------------------------------
+
+_STATUS_CACHE: dict[str, tuple[float, dict]] = {}
+
+
+def _provider_status(provider: str, server_url: str = "") -> dict:
+    """{"ok": bool, "text": short state} without spending anything."""
+    key = f"{provider}|{server_url}"
+    hit = _STATUS_CACHE.get(key)
+    if hit and time.time() - hit[0] < 20:
+        return hit[1]
+    cfg = PROVIDERS.get(provider) or {}
+    proto = cfg.get("native_protocol", "")
+    if proto == "lmstudio":
+        up = bool(_lmstudio_models(server_url or cfg["base_url"], _resolve_api_key(provider)))
+        st = {"ok": up, "text": f"server up {_lmstudio_base(server_url).split('//')[-1]}" if up
+              else "server not running"}
+    elif proto.endswith("_cli"):
+        exe = {"claude_cli": "claude", "codex_cli": "codex", "grok_cli": "grok", "agy_cli": "agy"}[proto]
+        try:
+            _cli_exe(exe, [str(Path.home() / ".local" / "bin" / "claude.exe"),
+                           r"D:\CLI-Data\.grok\bin\grok.exe", r"D:\CLI-Data\agy\agy.exe"])
+            st = {"ok": True, "text": f"{exe} CLI found"}
+        except Exception:
+            st = {"ok": False, "text": f"{exe} CLI not found"}
+    elif provider == "Custom":
+        st = {"ok": bool(server_url.strip()), "text": "server_url set" if server_url.strip() else "set server_url"}
+    elif cfg.get("needs_auth"):
+        ok = bool(_resolve_api_key(provider))
+        spec = cfg.get("env_var")
+        name = spec[0] if isinstance(spec, list) else spec
+        st = {"ok": ok, "text": "key found" if ok else f"no key: set {name}"}
+    else:
+        st = {"ok": True, "text": ""}
+    _STATUS_CACHE[key] = (time.time(), st)
+    return st
+
+
+def _model_info(provider: str, model: str, server_url: str = "") -> dict:
+    cfg = PROVIDERS.get(provider) or {}
+    proto = cfg.get("native_protocol", "")
+    name = (model or "").lower()
+    badges: list[list[str]] = []
+    lm: dict = {}
+    if proto == "lmstudio":
+        m = next((x for x in _lmstudio_models(server_url or cfg["base_url"], _resolve_api_key(provider))
+                  if x.get("key") == model), None)
+        if m:
+            caps = m.get("capabilities") or {}
+            inst = m.get("loaded_instances") or []
+            lm = {"quant": (m.get("quantization") or {}).get("name", ""), "params": m.get("params_string") or "",
+                  "arch": m.get("architecture") or "", "size_gb": round((m.get("size_bytes") or 0) / 1e9, 1),
+                  "loaded": bool(inst),
+                  "loaded_ctx": ((inst[0].get("config") or {}).get("context_length") if inst else None),
+                  "reasoning": (caps.get("reasoning") or {}).get("allowed_options") or []}
+            if caps.get("vision"):
+                badges.append(["vision", ""])
+            if lm["reasoning"]:
+                badges.append(["reasoning " + " / ".join(lm["reasoning"]), "a"])
+    elif proto == "gemini":
+        if "gemma" in name:
+            badges += [["vision", ""], ["no thinking control", "off"]]
+        else:
+            badges += [["vision", ""], ["video + audio", ""], ["thinking levels", "a"]]
+    elif proto == "agy_cli":
+        badges += [["vision", ""], ["audio", ""], ["subscription", "b"]]
+    elif proto.endswith("_cli"):
+        badges += [["vision", ""], ["subscription", "b"]]
+    elif provider in ("Grok (xAI)", "OpenAI"):
+        badges += [["vision", ""], ["reasoning effort", "a"]]
+
+    # Card labels: what each level sends for this model.
+    levels: dict[str, str] = {}
+    for q in ("fast", "normal", "quality", "ultra"):
+        s = _quality_settings(provider, model, q) or {}
+        v = s.get("reasoning_effort") or s.get("gemini_thinking_level") or ""
+        if proto == "lmstudio" and v and lm.get("reasoning"):
+            opts = lm["reasoning"]
+            v = v if v in opts else ("on" if v != "off" and "on" in opts else v)
+        levels[q] = v
+    hidden = _gemini_hidden_models() if proto == "gemini" else {}
+    return {"provider": provider, "model": model, "status": _provider_status(provider, server_url),
+            "providers": {p: _provider_status(p, server_url if p == provider else "")["ok"] for p in PROVIDERS},
+            "badges": badges, "lmstudio": lm, "levels": levels,
+            "audio": proto in AUDIO_PROTOCOLS and "gemma" not in name,
+            "hidden_count": len(hidden)}
+
+
+def _comfyui_root() -> Path:
+    """Walk up from this file to find ComfyUI root.
+
+    Expected layout: <ComfyUI>/custom_nodes/Luna-LLM-Tools/llm_prompt_api_node.py
+    So __file__.parent (node) .parent (custom_nodes) .parent (ComfyUI) = root.
+    """
+    return Path(__file__).resolve().parent.parent.parent
+
+
+def _load_env_file_keys() -> dict[str, str]:
+    """Load API keys from .env files. Standard KEY=VALUE per line, # for comments.
+
+    Search order (first match wins per key):
+      1. <ComfyUI root>/.env          (PRIMARY — keys live with the install, not the git repo)
+      2. <Luna-LLM-Tools node folder>/.env (fallback — only use if you must)
+
+    The node folder is INSIDE the git repo, so don't put your keys there unless
+    you've gitignored it. The ComfyUI root is the right location — it's outside
+    every custom node's repo, easy to back up, and standard practice.
+    """
+    keys: dict[str, str] = {}
+    candidates = [
+        _comfyui_root() / ".env",
+        Path(__file__).resolve().parent / ".env",
+    ]
+    for path in candidates:
+        try:
+            if not path.is_file():
+                continue
+            for raw_line in path.read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip().strip('"').strip("'")
+                if k and v and k not in keys:
+                    keys[k] = v
+        except Exception:
+            continue
+    return keys
+
+
+def _resolve_api_key(provider: str, override_key: str = "") -> str | None:
+    """Resolve the API key, in priority order:
+       1. Process environment variable (os.environ) — checks all accepted names
+       2. .env file in the ComfyUI root
+       3. .env file in the Luna-LLM-Tools node folder
+
+    The `override_key` parameter exists for backward compatibility but is no
+    longer wired to any node widget. Keys are NEVER stored in workflow JSON.
+    """
+    if override_key and override_key.strip():
+        return override_key.strip()
+    cfg = PROVIDERS.get(provider, {})
+    env_var_spec = cfg.get("env_var")
+    if not env_var_spec:
+        return None
+    # Normalize to list (each provider can accept multiple env var names)
+    env_var_names = env_var_spec if isinstance(env_var_spec, list) else [env_var_spec]
+
+    # 2. Process env — try every accepted name
+    for name in env_var_names:
+        v = os.environ.get(name)
+        if v and v.strip():
+            return v.strip()
+
+    # 3 + 4. .env file fallback — try every accepted name
+    file_keys = _load_env_file_keys()
+    for name in env_var_names:
+        if name in file_keys and file_keys[name].strip():
+            return file_keys[name].strip()
+    return None
+
+
+def _diagnose_env_keys() -> None:
+    """Print a one-time diagnostic showing which API key env vars ComfyUI sees.
+
+    Helps users debug why their system env var isn't being picked up — most
+    commonly because Easy-Install / embedded python doesn't inherit user-level
+    env vars, or the variable was set after Comfy started.
+    """
+    print("[Luna-LLMPromptAPI] API key environment check:")
+    for prov_name, prov_cfg in PROVIDERS.items():
+        spec = prov_cfg.get("env_var")
+        if not spec:
+            continue
+        names = spec if isinstance(spec, list) else [spec]
+        found = []
+        for name in names:
+            v = os.environ.get(name)
+            if v:
+                # Show only first 8 chars + length — don't leak the full key
+                preview = f"{v[:8]}…({len(v)} chars)"
+                found.append(f"{name}={preview}")
+        # Check .env file too
+        file_keys = _load_env_file_keys()
+        for name in names:
+            if name in file_keys and name not in [f.split("=")[0] for f in found]:
+                preview = f"{file_keys[name][:8]}…(.env)"
+                found.append(f"{name}={preview}")
+        if found:
+            print(f"  {prov_name}: {', '.join(found)}")
+        else:
+            print(f"  {prov_name}: NOT FOUND in env or .env (tried: {names})")
+
+
+# Run the diagnostic once at module load
+_diagnose_env_keys()
+
+
+def _resolve_base_url(provider: str, custom_url: str = "") -> str:
+    if custom_url and custom_url.strip():
+        return custom_url.strip().rstrip("/")
+    cfg = PROVIDERS.get(provider, {})
+    return str(cfg.get("base_url") or "").rstrip("/")
+
+
+# ---------------------------------------------------------------------------
+# Per-provider request sanitization
+# ---------------------------------------------------------------------------
+
+def _sanitize_payload_for_provider(provider: str, payload: dict) -> dict:
+    """Strip / rename parameters the provider rejects.
+
+    Returns a NEW dict — does not mutate input.
+    """
+    p = dict(payload)
+
+    if provider == "Grok (xAI)":
+        # Grok rejects llama.cpp-style sampling params
+        for k in ("top_k", "min_p", "repetition_penalty", "repeat_penalty"):
+            p.pop(k, None)
+        # Grok uses max_completion_tokens, not max_tokens
+        if "max_tokens" in p:
+            p["max_completion_tokens"] = p.pop("max_tokens")
+        # Grok requires seed to fit in a signed 32-bit int (max 2,147,483,647).
+        # ComfyUI's randomize widget uses unsigned 32-bit range (up to 2^32-1),
+        # so clamp via modulo to stay within Grok's bounds without losing entropy.
+        if "seed" in p:
+            seed_val = int(p["seed"])
+            if seed_val > 2147483647:
+                p["seed"] = seed_val % 2147483647
+        _m = str(p.get("model", "")).lower()
+        # Live probe 2026-10-04: EVERY current Grok chat model (4.3, 4.5, 4.6,
+        # 4.7, 4.20-0309-*) 400s on presence_penalty and frequency_penalty
+        # ("Model grok-4.6 does not support parameter presencePenalty."), and
+        # 4.3-4.7 also 400 on `stop`. Only 4.20-0309-non-reasoning took `stop`.
+        p.pop("presence_penalty", None)
+        p.pop("frequency_penalty", None)
+        if "grok-4.20" not in _m:
+            p.pop("stop", None)
+        # reasoning_effort is accepted by grok-4.3 / 4.5 / 4.6 / 4.7 /
+        # 4.20-multi-agent (4.3 and 4.7 verified live 2026-10-04). The 4.20
+        # reasoning/non-reasoning pair 400s on it, so drop it there. "xhigh" is
+        # verified on 4.6 and 4.7; 4.5 treats it as "high", so send "high".
+        if "reasoning_effort" in p:
+            # "none" exists for OpenAI but NOT for xAI — reasoning cannot be
+            # disabled, "low" is the floor (4.7: "This model does not support
+            # `reasoning_effort` value `none`."). Clamp instead of 400.
+            if p["reasoning_effort"] == "none":
+                p["reasoning_effort"] = "low"
+            if not any(t in _m for t in ("grok-4.3", "grok-4.5", "grok-4.6", "grok-4.7", "multi-agent")):
+                p.pop("reasoning_effort")
+            elif p["reasoning_effort"] == "xhigh" and not any(
+                    t in _m for t in ("grok-4.6", "grok-4.7", "multi-agent")):
+                p["reasoning_effort"] = "high"
+
+    elif provider == "OpenAI":
+        # Every rule below was established by live probe against gpt-5.6-luna /
+        # -terra / -sol on 2026-08-31, NOT from documentation — OpenAI does not
+        # document the reasoning/sampling interaction at all. See STATUS.md.
+        #
+        # Unknown to the OpenAI schema at any effort ("Unknown parameter").
+        for k in ("top_k", "min_p", "repetition_penalty", "repeat_penalty"):
+            p.pop(k, None)
+        # "'stop' is not supported with this model" — at every effort level.
+        p.pop("stop", None)
+        # "'max_tokens' is not supported with this model. Use
+        # 'max_completion_tokens' instead."
+        if "max_tokens" in p:
+            p["max_completion_tokens"] = p.pop("max_tokens")
+        _m = str(p.get("model", "")).lower()
+        # GPT-6 (probed 2026-10-04): gpt-6-sol and gpt-6-luna follow the 5.6
+        # rules below. gpt-6-astra and gpt-6.1-sol have NO "none" effort —
+        # "Supported values are: 'low', 'medium', 'high', and 'xhigh'." —
+        # so clamp to "low"; sampling is then stripped by the rule below.
+        if p.get("reasoning_effort") == "none" and _m.startswith(("gpt-6-astra", "gpt-6.1")):
+            p["reasoning_effort"] = "low"
+        # gpt-6-luna returns HTTP 500 (server_error, repeatable, 3/3) whenever
+        # presence_penalty or frequency_penalty is sent. gpt-6-sol accepts them.
+        if _m.startswith("gpt-6-luna"):
+            p.pop("presence_penalty", None)
+            p.pop("frequency_penalty", None)
+        # THE non-obvious one: temperature / top_p / presence_penalty /
+        # frequency_penalty are accepted ONLY at reasoning_effort="none".
+        # At low/medium/high/xhigh all four hard-400. Verified behaviourally
+        # too — at "none", temperature really does change the output
+        # (temp 0.0 -> 1 unique of 4 runs; temp 2.0 -> 4 unique of 4).
+        # Same rule re-verified on gpt-6-sol / -luna / -astra / 6.1-sol.
+        _effort = str(p.get("reasoning_effort", "")).lower()
+        if _effort and _effort != "none":
+            for k in ("temperature", "top_p", "presence_penalty", "frequency_penalty"):
+                p.pop(k, None)
+        # json_object mode requires the literal word "json" somewhere in the
+        # messages or OpenAI 400s. Drop the format rather than fail the run;
+        # the preset's own instructions still ask for JSON.
+        if isinstance(p.get("response_format"), dict) and \
+                p["response_format"].get("type") == "json_object":
+            _blob = json.dumps(p.get("messages", [])).lower()
+            if "json" not in _blob:
+                p.pop("response_format")
+                print("[Luna-LLMPromptAPI] OpenAI: dropped response_format=json_object "
+                      "(the API requires the word 'json' in the messages).")
+
+    elif provider == "Gemini":
+        # Gemini is handled by the NATIVE API path (_send_gemini_native), not
+        # this OpenAI-compat path. If we ever end up here for Gemini, strip
+        # everything the compat endpoint rejects.
+        p.pop("seed", None)
+        p.pop("extra_body", None)
+        p.pop("reasoning_effort", None)
+        p.pop("top_k", None)
+        p.pop("min_p", None)
+        p.pop("repetition_penalty", None)
+        p.pop("repeat_penalty", None)
+
+    elif provider == "Custom":
+        # Unknown server — be conservative, send everything
+        pass
+
+    # Drop zero/no-op params to keep the request clean
+    for k in ("top_k", "min_p"):
+        if k in p and (p[k] == 0 or p[k] == 0.0):
+            p.pop(k)
+    if "repetition_penalty" in p and abs(p["repetition_penalty"] - 1.0) < 1e-6:
+        p.pop("repetition_penalty")
+    if "repeat_penalty" in p and abs(p["repeat_penalty"] - 1.0) < 1e-6:
+        p.pop("repeat_penalty")
+    if "presence_penalty" in p and abs(p["presence_penalty"]) < 1e-6:
+        p.pop("presence_penalty")
+    if "frequency_penalty" in p and abs(p["frequency_penalty"]) < 1e-6:
+        p.pop("frequency_penalty")
+    if "seed" in p and p["seed"] == 0:
+        p.pop("seed")
+
+    return p
+
+
+# ---------------------------------------------------------------------------
+# Gemini-specific helpers
+# ---------------------------------------------------------------------------
+
+# Hardcoded safety: BLOCK_NONE for all categories. Gemini's hard server-side
+# filter catches truly forbidden content regardless of this setting; everything
+# else should be unblocked for creative prompt-generation work.
+_GEMINI_SAFETY_BLOCK_NONE = [
+    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+]
+
+
+# _apply_gemini_extras() removed — was for the broken OpenAI-compat extra_body
+# approach. Gemini now uses the native API path directly via _send_gemini_native.
+
+
+# Cache: hash of stable prefix -> Gemini cached content resource name + expiry
+_GEMINI_CACHE: dict[str, tuple[str, float]] = {}
+
+
+def _gemini_create_cached_content(
+    api_key: str,
+    model: str,
+    system_text: str,
+    stable_user_text: str,
+    ttl_seconds: int = 3600,
+) -> str | None:
+    """Create a Gemini cached content resource. Returns the resource name (cachedContents/...) or None.
+
+    Uses the NATIVE Gemini REST endpoint, not the OpenAI-compat layer.
+    Note: cached content must be >=1024 tokens; we estimate roughly via character count.
+    """
+    if not api_key:
+        return None
+    # Rough char->token estimate: 4 chars/token. Need ~4096 chars to clear 1024 tokens.
+    if (len(system_text) + len(stable_user_text)) < 4096:
+        return None  # Too small to be worth caching
+
+    cache_key = hashlib.sha256(
+        f"{model}|{system_text}|{stable_user_text}".encode("utf-8")
+    ).hexdigest()
+    now = time.time()
+    if cache_key in _GEMINI_CACHE:
+        name, expiry = _GEMINI_CACHE[cache_key]
+        if expiry > now + 60:
+            return name  # reuse, still valid for >1 minute
+
+    # Gemini native cached-content endpoint
+    # Key goes in the x-goog-api-key header below, not the query string.
+    url = "https://generativelanguage.googleapis.com/v1beta/cachedContents"
+    body = {
+        "model": f"models/{model}",
+        "contents": [
+            {"role": "user", "parts": [{"text": stable_user_text}]},
+        ],
+        "systemInstruction": {"parts": [{"text": system_text}]},
+        "ttl": f"{int(ttl_seconds)}s",
+    }
+    req = urllib.request.Request(
+        url, data=json.dumps(body).encode("utf-8"), method="POST",
+    )
+    req.add_header("Content-Type", "application/json")
+    req.add_header("x-goog-api-key", api_key)
+    try:
+        with urllib.request.urlopen(req, timeout=10.0) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print(f"[Luna-LLMPromptAPI] Gemini cache creation failed: {e}")
+        return None
+
+    name = data.get("name")
+    if not isinstance(name, str):
+        return None
+    expiry = now + ttl_seconds - 30  # 30s buffer
+    _GEMINI_CACHE[cache_key] = (name, expiry)
+    return name
+
+
+# ---------------------------------------------------------------------------
+# Native Gemini chat completion
+# ---------------------------------------------------------------------------
+# The OpenAI-compat layer rejects `seed`, `extra_body`, and silently drops
+# Gemini-specific config. The native API supports everything we want.
+
+def _convert_messages_to_gemini(messages: list[dict]) -> tuple[dict | None, list[dict]]:
+    """Convert OpenAI-style messages to Gemini native format.
+
+    Returns (system_instruction, contents) where:
+      - system_instruction is {"parts": [{"text": "..."}]} or None
+      - contents is list of {"role": "user"|"model", "parts": [...]}.
+
+    Handles multimodal user content (text + image_url) by converting image_url
+    data URIs to Gemini's inline_data blocks.
+    """
+    import base64
+
+    system_text = None
+    contents = []
+    for msg in messages:
+        role = msg.get("role")
+        content = msg.get("content")
+        if role == "system":
+            if isinstance(content, str) and content:
+                system_text = content
+            continue
+        # User / assistant messages
+        gemini_role = "model" if role == "assistant" else "user"
+        parts: list[dict] = []
+        if isinstance(content, str):
+            if content:
+                parts.append({"text": content})
+        elif isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                t = block.get("type")
+                if t == "text":
+                    text = block.get("text", "")
+                    if text:
+                        parts.append({"text": text})
+                elif t == "image_url":
+                    url = block.get("image_url", {}).get("url", "")
+                    # Expect data URI: data:image/png;base64,XXXX
+                    if url.startswith("data:"):
+                        try:
+                            header, b64 = url.split(",", 1)
+                            mime = header.split(";")[0].replace("data:", "")
+                            parts.append({
+                                "inline_data": {
+                                    "mime_type": mime or "image/png",
+                                    "data": b64,
+                                }
+                            })
+                        except Exception:
+                            pass
+        if parts:
+            contents.append({"role": gemini_role, "parts": parts})
+
+    system_instruction = {"parts": [{"text": system_text}]} if system_text else None
+    return system_instruction, contents
+
+
+def _send_gemini_native(
+    base_url: str,  # unused — SDK handles endpoints
+    api_key: str,
+    model: str,
+    messages: list[dict],
+    sampling: dict,
+    output_format: str,
+    stop_sequences: list[str],
+    thinking_budget: int,
+    thinking_level: str,
+    cached_content_name: str | None,
+    timeout: float,
+    video=None,
+    video_fps: float = 2.0,
+    include_thoughts: bool = False,
+    audio: list[bytes] | None = None,
+) -> str:
+    """Send a chat request via google-genai SDK.
+
+    Mirrors Luna Core / Comfy Pilot's gemini.py pattern. The SDK handles
+    endpoints, message format conversion, retries, and protocol versioning.
+    """
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError as e:
+        raise RuntimeError(
+            "google-genai SDK not installed. Run:\n"
+            "    pip install google-genai\n"
+            f"(import error: {e})"
+        ) from None
+
+    if not api_key:
+        raise RuntimeError("Gemini requires an API key — set GEMINI_API_KEY in env or .env")
+    if not model or model.startswith("<"):
+        raise RuntimeError(f"Invalid model: {model!r}.")
+
+    client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=int(timeout * 1000)))
+
+    # Convert messages: extract system, convert user content (including images)
+    system_text = None
+    contents = []
+    for msg in messages:
+        role = msg.get("role")
+        content = msg.get("content")
+        if role == "system":
+            if isinstance(content, str) and content:
+                system_text = content
+            continue
+        gemini_role = "model" if role == "assistant" else "user"
+        parts: list = []
+        if isinstance(content, str):
+            if content:
+                parts.append(types.Part(text=content))
+        elif isinstance(content, list):
+            import base64
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                t = block.get("type")
+                if t == "text":
+                    text = block.get("text", "")
+                    if text:
+                        parts.append(types.Part(text=text))
+                elif t == "image_url":
+                    url = block.get("image_url", {}).get("url", "")
+                    if url.startswith("data:"):
+                        try:
+                            header, b64 = url.split(",", 1)
+                            mime = header.split(";")[0].replace("data:", "") or "image/png"
+                            parts.append(types.Part(inline_data=types.Blob(
+                                mime_type=mime,
+                                data=base64.b64decode(b64),
+                            )))
+                        except Exception:
+                            pass
+        if parts:
+            contents.append(types.Content(role=gemini_role, parts=parts))
+
+    # Audio clips (WAV) ride inline with the user turn. TESTED 2026-10-12:
+    # gemini-3.8-flash quoted a spoken test sentence exactly.
+    for clip in audio or []:
+        part = types.Part(inline_data=types.Blob(mime_type="audio/wav", data=clip))
+        if contents and contents[-1].role == "user":
+            contents[-1].parts.append(part)
+        else:
+            contents.append(types.Content(role="user", parts=[part]))
+
+    # Build the SDK config — match Luna Core's simple pattern
+    config_kwargs: dict[str, Any] = {}
+    if system_text:
+        config_kwargs["system_instruction"] = system_text
+    if "temperature" in sampling:
+        config_kwargs["temperature"] = float(sampling["temperature"])
+    if "top_p" in sampling:
+        config_kwargs["top_p"] = float(sampling["top_p"])
+    if sampling.get("top_k", 0):
+        config_kwargs["top_k"] = int(sampling["top_k"])
+    if "max_tokens" in sampling:
+        config_kwargs["max_output_tokens"] = int(sampling["max_tokens"])
+    if stop_sequences:
+        config_kwargs["stop_sequences"] = list(stop_sequences)
+    if output_format == "json":
+        config_kwargs["response_mime_type"] = "application/json"
+    # Thinking control. On Gemini 3 Pro the API uses thinking_level (low/medium/
+    # high) instead of a token budget; the two are mutually exclusive. When a
+    # level is set AND the model is a Gen-3 Pro, send the level; otherwise fall
+    # back to the token budget (0 = disabled, recommended for prompt gen).
+    # The split is by MAJOR FAMILY, not by Pro/Flash tier. Probed against the
+    # live API 2026-08-05:
+    #
+    #   model                    budget=0   level=low   omitted
+    #   gemini-3.6-flash         400        OK          OK
+    #   gemini-3.5-flash         OK         OK          OK
+    #   gemini-3.5-flash-lite    400        OK          OK
+    #   gemini-3.1-pro-preview   400        OK          OK
+    #   gemini-3-flash-preview   OK         OK          OK
+    #   gemini-2.5-flash         OK         400         OK
+    #
+    # So: every Gemini 3 accepts thinking_level and several reject
+    # thinking_budget; 2.5 is the reverse. Do NOT narrow this back to a
+    # "pro" check — that was the bug, and it made gemini-3.6-flash fail with
+    # HTTP 400 INVALID_ARGUMENT on every call.
+    # Gemma is served by the same key and endpoint but has no thinking config at
+    # all — sending either field is a 400. Must be checked before the Gemini
+    # branches, because a Gemma name matches neither and would fall through to
+    # thinking_budget below.
+    _is_gemma = "gemma" in model.lower()
+    # The rolling `-latest` aliases resolve to Gen-3 models now
+    # (2026-10-04: flash-latest -> 3.8-flash, pro-latest -> 3.1-pro-preview,
+    # flash-lite-latest -> 3.5-flash-lite). pro-latest and flash-lite-latest
+    # 400 on thinkingBudget=0 ("Budget 0 is invalid. This model only works in
+    # thinking mode.") and all three accept thinking_level, so route them as Gen-3.
+    _is_gen3 = "gemini-3" in model.lower() or (
+        model.lower().startswith("gemini-") and model.lower().endswith("-latest"))
+    if _is_gemma:
+        pass
+    elif _is_gen3:
+        # No true "off" on Gen-3; "low" is the nearest to disabled.
+        _level = thinking_level if (thinking_level and thinking_level != "None") else "low"
+        try:
+            think = {"thinking_level": _level}
+            if include_thoughts:
+                think["include_thoughts"] = True
+            config_kwargs["thinking_config"] = types.ThinkingConfig(**think)
+        except Exception:
+            # SDK too old for thinking_level — omit the config entirely, which
+            # every model accepts, rather than sending a budget it may reject.
+            pass
+    elif thinking_budget >= 0:
+        config_kwargs["thinking_config"] = types.ThinkingConfig(
+            thinking_budget=int(thinking_budget),
+        )
+    # Hardcoded BLOCK_NONE for all four configurable safety categories
+    config_kwargs["safety_settings"] = [
+        types.SafetySetting(
+            category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"
+        ),
+        types.SafetySetting(
+            category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_NONE"
+        ),
+        types.SafetySetting(
+            category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_NONE"
+        ),
+        types.SafetySetting(
+            category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"
+        ),
+    ]
+    if cached_content_name:
+        config_kwargs["cached_content"] = cached_content_name
+
+    start = time.perf_counter()
+    try:
+        media = (gemini_video_part(client, types, video, video_fps, timeout)
+                 if video is not None else nullcontext(None))
+        with media as video_part:
+            if video_part is not None:
+                if contents and contents[-1].role == "user":
+                    contents[-1].parts.append(video_part)
+                else:
+                    contents.append(types.Content(role="user", parts=[video_part]))
+            try:
+                response = client.models.generate_content(
+                    model=model, contents=contents,
+                    config=types.GenerateContentConfig(**config_kwargs))
+            except Exception as e:
+                # The Fast level asks for "minimal", which 3.8-flash and
+                # 3.1-pro reject (live 2026-10-12): retry once at "low".
+                if "MINIMAL is not supported" not in str(e):
+                    raise
+                print(f"[Luna-LLMPromptAPI] {model} has no thinking_level minimal; using low.")
+                _GEMINI_NO_MINIMAL.add(model.lower())
+                _note_run(level="low")
+                tc = config_kwargs["thinking_config"]
+                config_kwargs["thinking_config"] = types.ThinkingConfig(
+                    thinking_level="low", include_thoughts=tc.include_thoughts)
+                response = client.models.generate_content(
+                    model=model, contents=contents,
+                    config=types.GenerateContentConfig(**config_kwargs))
+    except Exception as e:
+        # SDK exception messages are usually descriptive enough
+        raise RuntimeError(f"Gemini SDK error: {e}") from None
+    finally:
+        client.close()
+    elapsed = max(time.perf_counter() - start, 1e-6)
+
+    # Extract text from response. Thought parts (include_thoughts) go to the
+    # run stats, never into the prompt.
+    result_text, thoughts = "", ""
+    for cand in (response.candidates or [])[:1]:
+        if cand.content and cand.content.parts:
+            for p in cand.content.parts:
+                if getattr(p, "text", None):
+                    if getattr(p, "thought", False):
+                        thoughts += p.text
+                    else:
+                        result_text += p.text
+    finish = ""
+    try:
+        finish = str(response.candidates[0].finish_reason or "").replace("FinishReason.", "").lower()
+    except Exception:
+        pass
+    served = getattr(response, "model_version", None) or model
+    _note_run(seconds=round(elapsed, 2), served=served, finish=finish, reasoning=thoughts.strip())
+    _note_served_model(model, served)
+
+    # Log usage like Luna Core does
+    try:
+        usage = response.usage_metadata
+        pt = getattr(usage, "prompt_token_count", None)
+        ct = getattr(usage, "candidates_token_count", None)
+        cached = getattr(usage, "cached_content_token_count", None) or 0
+        tt = getattr(usage, "thoughts_token_count", None) or 0
+        cache_note = f", cached={cached}" if cached else ""
+        think_note = f", thoughts={tt}" if tt else ""
+        _note_run(tokens_in=pt, tokens_out=ct, reasoning_tokens=tt or None)
+        print(
+            f"[Luna-LLMPromptAPI] Gemini | {model} | "
+            f"prompt={pt}, completion={ct}{cache_note}{think_note}, "
+            f"time={elapsed:.2f}s"
+        )
+    except Exception:
+        print(f"[Luna-LLMPromptAPI] Gemini | {model} | time={elapsed:.2f}s")
+
+    return result_text.strip()
+
+
+# ---------------------------------------------------------------------------
+# HTTP chat completion (OpenAI-compatible — LM Studio, Grok, Custom)
+# ---------------------------------------------------------------------------
+
+def _send_chat_completion(
+    provider: str,
+    base_url: str,
+    api_key: str | None,
+    model: str,
+    messages: list[dict],
+    sampling: dict,
+    output_format: str,
+    stop_sequences: list[str],
+    timeout: float,
+    extra_body: dict | None = None,
+    response_format_override: dict | None = None,
+    reasoning_effort: str = "default",
+) -> str:
+    """POST to /v1/chat/completions with per-provider sanitization + retry.
+
+    sampling dict can contain: temperature, top_p, top_k, presence_penalty,
+    frequency_penalty, max_tokens, seed. (min_p / repetition_penalty were
+    dropped 2026-08-31 — every cloud provider rejects them; they live on in
+    the local GGUF node where they do real work.)
+
+    response_format_override: if set, used as-is for response_format (e.g. a
+    json_schema dict). Takes priority over the output_format-derived default.
+    """
+    if not base_url:
+        raise RuntimeError("Empty server URL. Set a provider or fill in server_url.")
+    if not model or model.startswith("<"):
+        raise RuntimeError(f"Invalid model: {model!r}. Pick a real model from the dropdown.")
+
+    url = base_url.rstrip("/") + "/chat/completions"
+
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+    }
+    payload.update(sampling)
+
+    if stop_sequences:
+        payload["stop"] = stop_sequences
+
+    if response_format_override:
+        payload["response_format"] = response_format_override
+    elif output_format == "json":
+        # Forced JSON at the API level — more reliable than instructions
+        payload["response_format"] = {"type": "json_object"}
+
+    if reasoning_effort and reasoning_effort != "default":
+        # Gated per-model inside _sanitize_payload_for_provider(); set it here so
+        # the sanitizer is the single place that knows which models accept it.
+        payload["reasoning_effort"] = reasoning_effort
+
+    if extra_body:
+        # The OpenAI SDK flattens extra_body into the top-level request body; it
+        # does NOT send a literal "extra_body" field. Since this node POSTs raw
+        # JSON (not via the SDK), we replicate that flattening here so params like
+        # chat_template_kwargs land at the top level where LM Studio reads them.
+        for k, v in extra_body.items():
+            payload[k] = v
+
+    # Per-provider sanitization
+    payload = _sanitize_payload_for_provider(provider, payload)
+
+    body = json.dumps(payload).encode("utf-8")
+
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    # Retry once on transient failures (429 rate limit, 503 overloaded)
+    last_err: Exception | None = None
+    for attempt in range(2):
+        req = urllib.request.Request(url, data=body, method="POST")
+        for k, v in headers.items():
+            req.add_header(k, v)
+
+        start = time.perf_counter()
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8")
+            elapsed = max(time.perf_counter() - start, 1e-6)
+            break  # success
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 503) and attempt == 0:
+                print(f"[Luna-LLMPromptAPI] HTTP {e.code} on attempt {attempt+1}, retrying in 1.5s...")
+                time.sleep(1.5)
+                last_err = e
+                continue
+            try:
+                err_body = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                err_body = ""
+            raise RuntimeError(
+                f"HTTP {e.code} from {url}: {err_body[:500] or e.reason}"
+            ) from None
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"Cannot reach {url}: {e.reason}") from None
+        except TimeoutError:
+            if attempt == 0:
+                print(f"[Luna-LLMPromptAPI] Timeout on attempt {attempt+1}, retrying...")
+                last_err = TimeoutError("first attempt timed out")
+                continue
+            raise RuntimeError(f"Timed out after {timeout}s waiting for {url}") from None
+    else:
+        # Loop exited without break — both attempts failed
+        raise RuntimeError(f"Both attempts failed: {last_err}") from None
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        raise RuntimeError(f"Non-JSON response from {url}: {raw[:500]}") from None
+
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Unexpected response shape from {url}: {raw[:500]}")
+
+    err = data.get("error")
+    if isinstance(err, dict):
+        raise RuntimeError(f"API error: {err.get('message', err)}")
+
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise RuntimeError(f"No choices in response: {raw[:500]}")
+
+    first = choices[0] or {}
+    msg = first.get("message") or {}
+    content = msg.get("content", "")
+
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict):
+                t = block.get("text")
+                if isinstance(t, str):
+                    parts.append(t)
+        content = "".join(parts)
+
+    usage = data.get("usage") or {}
+    pt = usage.get("prompt_tokens")
+    ct = usage.get("completion_tokens")
+    cached = usage.get("prompt_tokens_details", {}).get("cached_tokens") if isinstance(usage.get("prompt_tokens_details"), dict) else None
+    cache_note = f", cached={cached}" if cached else ""
+    print(
+        f"[Luna-LLMPromptAPI] {provider} | {model} | "
+        f"prompt={pt}, completion={ct}{cache_note}, time={elapsed:.2f}s"
+    )
+    details = usage.get("completion_tokens_details")
+    reasoning = msg.get("reasoning_content") or msg.get("reasoning") or ""
+    _note_run(seconds=round(elapsed, 2), tokens_in=pt, tokens_out=ct, served=data.get("model") or model,
+              finish=str(first.get("finish_reason") or ""),
+              reasoning_tokens=details.get("reasoning_tokens") if isinstance(details, dict) else None,
+              reasoning=reasoning.strip() if isinstance(reasoning, str) else "")
+
+    return str(content or "").strip()
+
+
+# ---------------------------------------------------------------------------
+# Image / video message builders
+# ---------------------------------------------------------------------------
+
+def _build_multimodal_user_content(text: str, images_b64: list[str]) -> list[dict]:
+    """Build OpenAI-style multimodal user content array (text + image_url blocks)."""
+    parts: list[dict] = [{"type": "text", "text": text}]
+    for img_b64 in images_b64:
+        if not img_b64:
+            continue
+        parts.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{img_b64}"},
+        })
+    return parts
+
+
+# ---------------------------------------------------------------------------
+# Subscription CLI routes (Claude Max / Codex ChatGPT / SuperGrok)
+# ---------------------------------------------------------------------------
+
+def _cli_split_messages(messages: list[dict]) -> tuple[str, str, list[str]]:
+    """OpenAI-style messages -> (system text, user text, [base64 PNG])."""
+    system, text, images = "", "", []
+    for m in messages:
+        content = m.get("content")
+        if m.get("role") == "system":
+            system = content if isinstance(content, str) else ""
+            continue
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            for part in content:
+                if part.get("type") == "text":
+                    text = part.get("text", "")
+                elif part.get("type") == "image_url":
+                    url = (part.get("image_url") or {}).get("url", "")
+                    if "," in url:
+                        images.append(url.split(",", 1)[1])
+    return system, text, images
+
+
+def _cli_exe(name: str, extra: list[str]) -> str:
+    import shutil
+    found = shutil.which(name)
+    if found:
+        return found
+    for cand in extra:
+        if cand and Path(cand).is_file():
+            return cand
+    raise RuntimeError(f"The `{name}` CLI was not found on PATH (looked also in {extra}).")
+
+
+def _cli_workdir():
+    """A throwaway working folder outside every project, removed afterwards."""
+    import tempfile
+    try:
+        import folder_paths
+        root = Path(folder_paths.get_temp_directory()) / "llm_prompt_cli"
+    except Exception:
+        root = Path(tempfile.gettempdir()) / "llm_prompt_cli"
+    root.mkdir(parents=True, exist_ok=True)
+    return tempfile.TemporaryDirectory(dir=str(root))
+
+
+def _cli_effort(reasoning_effort: str) -> str | None:
+    e = (reasoning_effort or "").lower()
+    if e in ("", "default"):
+        return None
+    return "low" if e == "none" else e
+
+
+def _cli_run(cmd: list[str], *, input_text: str | None, cwd: str, timeout: float,
+             env: dict | None = None):
+    import subprocess
+    try:
+        return subprocess.run(cmd, input=input_text, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", cwd=cwd, env=env,
+                              timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"{Path(cmd[0]).name} did not answer within {timeout:.0f}s.") from None
+
+
+def _send_claude_cli(model: str, messages: list[dict], timeout: float, reasoning_effort: str) -> str:
+    """Claude Code headless on the Max login. Live-tested 2026-10-04."""
+    exe = _cli_exe("claude", [str(Path.home() / ".local" / "bin" / "claude.exe")])
+    system, text, images = _cli_split_messages(messages)
+    content = [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b}}
+               for b in images]
+    content.append({"type": "text", "text": text or "Describe a scene vividly."})
+    line = json.dumps({"type": "user", "message": {"role": "user", "content": content}})
+    with _cli_workdir() as wd:
+        cmd = [exe, "-p", "--model", model, "--tools", "", "--strict-mcp-config",
+               "--setting-sources", "", "--no-session-persistence",
+               "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"]
+        if system:
+            sp = Path(wd) / "system.md"
+            sp.write_text(system, encoding="utf-8")
+            cmd += ["--system-prompt-file", str(sp)]
+        effort = _cli_effort(reasoning_effort)
+        if effort:
+            cmd += ["--effort", effort]
+        t0 = time.perf_counter()
+        p = _cli_run(cmd, input_text=line + "\n", cwd=wd, timeout=timeout)
+    result = None
+    for ln in p.stdout.splitlines():
+        try:
+            ev = json.loads(ln)
+        except Exception:
+            continue
+        if ev.get("type") == "result":
+            result = ev
+    if not result:
+        raise RuntimeError(f"Claude CLI returned no result (exit {p.returncode}): "
+                           f"{(p.stderr or p.stdout)[-600:]}")
+    if result.get("is_error"):
+        raise RuntimeError(f"Claude CLI: {result.get('result')}")
+    used = ", ".join((result.get("modelUsage") or {}).keys()) or model
+    elapsed = time.perf_counter() - t0
+    print(f"[Luna-LLMPromptAPI] Claude (Max) | {used} | {len(images)} image(s) | "
+          f"time={elapsed:.2f}s (api {result.get('duration_api_ms', 0) / 1000:.1f}s)")
+    u = result.get("usage") or {}
+    _note_run(seconds=round(elapsed, 2), served=used, tokens_in=u.get("input_tokens"),
+              tokens_out=u.get("output_tokens"))
+    return result.get("result") or ""
+
+
+def _send_codex_cli(model: str, messages: list[dict], timeout: float, reasoning_effort: str) -> str:
+    """Codex CLI headless on the ChatGPT login. Live-tested 2026-10-04."""
+    import base64 as _b64
+    exe = _cli_exe("codex", [str(Path(os.environ.get("APPDATA", "")) / "npm" / "codex.cmd")])
+    system, text, images = _cli_split_messages(messages)
+    prompt = (f"{system}\n\n---\n\n{text}" if system else text) or "Describe a scene vividly."
+    with _cli_workdir() as wd:
+        out = Path(wd) / "last.txt"
+        cmd = [exe, "exec", "-m", model, "-s", "read-only", "--skip-git-repo-check",
+               "--ephemeral", "--color", "never", "-C", wd, "-o", str(out)]
+        effort = _cli_effort(reasoning_effort)
+        if effort:
+            cmd += ["-c", f'model_reasoning_effort="{effort}"']
+        for i, b in enumerate(images):
+            ip = Path(wd) / f"image_{i:02d}.png"
+            ip.write_bytes(_b64.b64decode(b))
+            cmd += ["-i", str(ip)]
+        cmd.append("-")  # prompt from stdin
+        t0 = time.perf_counter()
+        p = _cli_run(cmd, input_text=prompt, cwd=wd, timeout=timeout)
+        answer = out.read_text(encoding="utf-8").strip() if out.is_file() else ""
+    if not answer:
+        raise RuntimeError(f"Codex CLI returned nothing (exit {p.returncode}): "
+                           f"{(p.stderr or p.stdout)[-600:]}")
+    elapsed = time.perf_counter() - t0
+    print(f"[Luna-LLMPromptAPI] Codex (ChatGPT) | {model} | {len(images)} image(s) | "
+          f"time={elapsed:.2f}s")
+    _note_run(seconds=round(elapsed, 2), served=model)
+    return answer
+
+
+_GROK_CMDLINE_BUDGET = 30000  # Windows CreateProcess caps a command line at 32767 chars
+
+
+def _send_grok_cli(model: str, messages: list[dict], timeout: float, reasoning_effort: str) -> str:
+    """Grok CLI headless on the grok.com (SuperGrok) login. Live-tested 2026-10-04."""
+    import base64 as _b64
+    from PIL import Image as _Image
+    import io as _stdio  # module-level `io` is comfy_api.latest.io
+    exe = _cli_exe("grok", [r"D:\CLI-Data\.grok\bin\grok.exe"])
+    system, text, images = _cli_split_messages(messages)
+    env = {k: v for k, v in os.environ.items() if k not in ("XAI_API_KEY", "GROK_API_KEY")}
+    with _cli_workdir() as wd:
+        base = [exe, "-m", model, "--output-format", "json", "--tools", "", "--max-turns", "1",
+                "--no-subagents", "--cwd", wd]
+        effort = _cli_effort(reasoning_effort)
+        if effort:
+            base += ["--reasoning-effort", effort]
+        # Short presets ride as the system prompt; long ones go into the text
+        # so the command line stays under the Windows limit.
+        body = text or "Describe a scene vividly."
+        if system and len(system) <= 6000:
+            base += ["--system-prompt-override", system]
+        elif system:
+            body = f"INSTRUCTIONS:\n{system}\n\n---\n\n{body}"
+        blocks = [{"type": "text", "text": body}]
+        note = ""
+        if images:
+            room = _GROK_CMDLINE_BUDGET - len(" ".join(base)) - len(json.dumps(blocks)) - 200
+            sent = []
+            for side in (768, 512, 384, 256, 192):
+                sent = []
+                for b in images:
+                    im = _Image.open(_stdio.BytesIO(_b64.b64decode(b))).convert("RGB")
+                    im.thumbnail((side, side))
+                    buf = _stdio.BytesIO()
+                    im.save(buf, "JPEG", quality=80)
+                    sent.append(_b64.b64encode(buf.getvalue()).decode())
+                if sum(len(x) + 60 for x in sent) <= room:
+                    break
+            else:
+                sent = []
+            if sent:
+                blocks += [{"type": "image", "data": x, "mimeType": "image/jpeg"} for x in sent]
+                note = f"{len(sent)} image(s) at <= {side}px"
+            else:
+                note = "images DROPPED (too large for the command line)"
+                print("[Luna-LLMPromptAPI] Grok (SuperGrok): " + note)
+        if len(blocks) > 1:
+            cmd = base + ["--prompt-json", json.dumps(blocks)]
+            p_in = None
+        else:
+            pf = Path(wd) / "prompt.md"
+            pf.write_text(body, encoding="utf-8")
+            cmd = base + ["--prompt-file", str(pf)]
+        t0 = time.perf_counter()
+        p = _cli_run(cmd, input_text=None, cwd=wd, timeout=timeout, env=env)
+    try:
+        payload = json.loads(p.stdout)
+    except Exception:
+        raise RuntimeError(f"Grok CLI returned no JSON (exit {p.returncode}): "
+                           f"{(p.stderr or p.stdout)[-600:]}") from None
+    answer = (payload.get("text") or "").strip()
+    if not answer:
+        raise RuntimeError(f"Grok CLI returned no text (stopReason={payload.get('stopReason')}).")
+    elapsed = time.perf_counter() - t0
+    print(f"[Luna-LLMPromptAPI] Grok (SuperGrok) | {model} | {note or 'text only'} | "
+          f"time={elapsed:.2f}s")
+    _note_run(seconds=round(elapsed, 2), served=model, finish=str(payload.get("stopReason") or ""))
+    return answer
+
+
+def _send_agy_cli(model: str, messages: list[dict], timeout: float, reasoning_effort: str,
+                  audio: list[tuple[bytes, str]] | None = None) -> str:
+    """Antigravity CLI (`agy`) headless on Peter's Gemini login. TESTED 2026-10-12: it reads
+    prompt.md, looks at the images and listens to the audio in its folder, in plan mode."""
+    import base64 as _b64
+    exe = _cli_exe("agy", [r"D:\CLI-Data\agy\agy.exe"])
+    system, text, images = _cli_split_messages(messages)
+    # The level rides in the model name: gemini-3.8-flash-low / -medium / -high.
+    # 3.1 Pro has only low and high.
+    effort = {"none": "low", "low": "low", "medium": "medium", "high": "high",
+              "xhigh": "high", "max": "high"}.get((reasoning_effort or "").lower(), "low")
+    base = re.sub(r"-(low|medium|high)$", "", model)
+    if "pro" in base and effort == "medium":
+        effort = "high"
+    slug = f"{base}-{effort}"
+    with _cli_workdir() as wd:
+        names = []
+        for i, b in enumerate(images):
+            (Path(wd) / f"image_{i:02d}.png").write_bytes(_b64.b64decode(b))
+            names.append(f"image_{i:02d}.png")
+        for i, (data, ext) in enumerate(audio or []):
+            (Path(wd) / f"audio_{i:02d}.{ext}").write_bytes(data)
+            names.append(f"audio_{i:02d}.{ext}")
+        body = text or "Describe a scene vividly."
+        if system:
+            body = f"SYSTEM INSTRUCTIONS:\n{system}\n\n---\n\n{body}"
+        if names:
+            body += "\n\nATTACHED FILES (in this folder): " + ", ".join(names)
+        (Path(wd) / "prompt.md").write_text(body, encoding="utf-8")
+        cmd = [exe, "-p",
+               "Read prompt.md in the current folder and follow it exactly. Look at and listen to the "
+               "attached files it names. Do not write, edit or run anything. Reply with only the final "
+               "answer text.",
+               "--mode", "plan", "--dangerously-skip-permissions", "--model", slug,
+               "--output-format", "json", "--print-timeout", f"{int(timeout)}s"]
+        t0 = time.perf_counter()
+        p = _cli_run(cmd, input_text=None, cwd=wd, timeout=timeout + 15)
+    try:
+        payload = json.loads(p.stdout.strip().splitlines()[-1])
+    except Exception:
+        raise RuntimeError(f"Antigravity CLI returned no JSON (exit {p.returncode}): "
+                           f"{(p.stderr or p.stdout)[-600:]}") from None
+    answer = (payload.get("response") or "").strip()
+    if payload.get("status") != "SUCCESS" or not answer:
+        raise RuntimeError(f"Antigravity CLI: status {payload.get('status')}: {(p.stderr or p.stdout)[-400:]}")
+    elapsed = time.perf_counter() - t0
+    u = payload.get("usage") or {}
+    print(f"[Luna-LLMPromptAPI] Gemini (Antigravity) | {slug} | {len(names)} file(s) | time={elapsed:.2f}s")
+    _note_run(seconds=round(elapsed, 2), served=slug, tokens_in=u.get("input_tokens"),
+              tokens_out=u.get("output_tokens"), reasoning_tokens=u.get("thinking_tokens") or None)
+    return answer
+
+
+def _send_lmstudio(base_url: str, api_key: str | None, model: str, messages: list[dict],
+                   sampling: dict, timeout: float, reasoning_effort: str, context_length: int,
+                   unload_after_run: bool) -> str:
+    """LM Studio's native chat (POST /api/v1/chat), with the unload rule.
+
+    Unload rule (Peter, 2026-10-12, "yes"): unload only a model this request
+    loaded — the reply carries model_load_time_seconds only then. A model that
+    was already loaded (by Peter or Luna Bridge) is used as it is: no
+    context_length is sent for it, because a different one makes LM Studio
+    load a second copy and evict the first (TESTED 2026-10-12).
+    """
+    info = next((m for m in _lmstudio_models(base_url, api_key) if m.get("key") == model), None)
+    if info is None and not _lmstudio_models(base_url, api_key):
+        _lmstudio_request(base_url, "/api/v1/models", api_key)  # raises the plain "not running" error
+    loaded = bool(info and info.get("loaded_instances"))
+
+    system, text, images = _cli_split_messages(messages)
+    content = [{"type": "text", "content": text or "Describe a scene vividly."}]
+    content += [{"type": "image", "data_url": f"data:image/png;base64,{b}"} for b in images]
+    body: dict[str, Any] = {"model": model, "input": content, "store": False,
+                            "max_output_tokens": int(sampling.get("max_tokens") or 4096)}
+    if system:
+        body["system_prompt"] = system
+    for k in ("temperature", "top_p", "top_k", "min_p", "repeat_penalty"):
+        if k in sampling:
+            body[k] = sampling[k]
+    if body.get("top_k") == 0:
+        body.pop("top_k")
+    if not loaded and context_length and context_length > 0:
+        body["context_length"] = int(context_length)
+
+    # Reasoning: the model's own options decide. Off / on models get "on" for
+    # any thinking level; a model without reasoning gets nothing.
+    allowed = ((info or {}).get("capabilities") or {}).get("reasoning", {}) or {}
+    options = allowed.get("allowed_options") or []
+    e = (reasoning_effort or "").lower()
+    want = {"none": "off", "off": "off", "low": "low", "medium": "medium", "high": "high",
+            "xhigh": "high", "on": "on"}.get(e)
+    if options and want:
+        if want not in options:
+            want = "on" if want != "off" and "on" in options else ("off" if "off" in options else None)
+        if want:
+            body["reasoning"] = want
+
+    t0 = time.perf_counter()
+    data = _lmstudio_request(base_url, "/api/v1/chat", api_key, body, timeout=timeout)
+    elapsed = time.perf_counter() - t0
+    answer, thoughts = "", ""
+    for item in data.get("output") or []:
+        if item.get("type") == "message":
+            answer += item.get("content") or ""
+        elif item.get("type") == "reasoning":
+            thoughts += item.get("content") or ""
+    st = data.get("stats") or {}
+    instance = data.get("model_instance_id") or model
+    load_s = st.get("model_load_time_seconds")
+    unloaded = False
+    if load_s is not None and unload_after_run:
+        try:
+            _lmstudio_request(base_url, "/api/v1/models/unload", api_key, {"instance_id": instance}, timeout=30)
+            unloaded = True
+        except Exception as ex:
+            print(f"[Luna-LLMPromptAPI] LM Studio unload failed: {ex}")
+    state = "unloaded" if unloaded else ("loaded by this run, kept" if load_s is not None else "already loaded, kept")
+    print(f"[Luna-LLMPromptAPI] LM Studio | {instance} | reasoning={body.get('reasoning', '-')} | "
+          f"out={st.get('total_output_tokens')} tok, {st.get('tokens_per_second') or 0:.0f} tok/s | "
+          f"time={elapsed:.2f}s | {state}")
+    _note_run(seconds=round(elapsed, 2), served=instance, tokens_in=st.get("input_tokens"),
+              tokens_out=st.get("total_output_tokens"), reasoning_tokens=st.get("reasoning_output_tokens") or None,
+              tok_s=round(st.get("tokens_per_second") or 0, 1) or None,
+              load_s=round(load_s, 1) if load_s is not None else None,
+              model_state=state, level=body.get("reasoning"), reasoning=thoughts.strip())
+    return answer.strip()
+
+
+# ---------------------------------------------------------------------------
+# The writer core (shared by the node and luna_writer_api)
+# ---------------------------------------------------------------------------
+
+# Routes that take audio (Peter, 2026-10-12: "and dont forget the audio input").
+# TESTED with a spoken clip 2026-10-12: Gemini API and agy yes; Grok API, OpenAI
+# gpt-5.6 / gpt-6 chat and Codex CLI no; LM Studio's chat takes text + image only.
+AUDIO_PROTOCOLS = ("gemini", "agy_cli")
+_AUDIO_MAX_SECONDS = 15 * 60  # Gemini's limit for all audio in one prompt
+
+
+def _audio_to_wav(audio) -> list[bytes]:
+    """A ComfyUI AUDIO dict ({"waveform": [B, C, T], "sample_rate"}) -> 16-bit WAV per batch item."""
+    if not audio or not isinstance(audio, dict) or audio.get("waveform") is None:
+        return []
+    import io as _stdio  # module-level `io` is comfy_api.latest.io
+    import wave
+    import torch
+    wav = audio["waveform"]
+    rate = int(audio.get("sample_rate") or 44100)
+    if getattr(wav, "ndim", 0) == 2:
+        wav = wav.unsqueeze(0)
+    clips = []
+    for item in wav:
+        if item.shape[-1] == 0:
+            continue
+        if item.shape[-1] / rate > _AUDIO_MAX_SECONDS:
+            raise ValueError(f"The audio is {item.shape[-1] / rate / 60:.1f} min long; "
+                             f"Gemini takes at most {_AUDIO_MAX_SECONDS // 60} min per prompt.")
+        pcm = (item.float().clamp(-1, 1) * 32767).round().to(dtype=torch.int16)
+        buf = _stdio.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(int(pcm.shape[0]))
+            w.setsampwidth(2)
+            w.setframerate(rate)
+            w.writeframes(pcm.t().contiguous().numpy().tobytes())
+        clips.append(buf.getvalue())
+    return clips
+
+
+def _video_route(provider: str, model_name: str, video, video_input_mode: str) -> tuple[dict, bool]:
+    """(provider config, native_video). Raises the node's provider / video-mode errors."""
+    cfg = PROVIDERS.get(provider)
+    if not cfg:
+        raise RuntimeError(f"Unknown provider: {provider!r}")
+    if video_input_mode not in ("auto", "native_video", "sampled_frames"):
+        raise ValueError(f"Unknown video input mode: {video_input_mode!r}")
+    native_video = video is not None and video_input_mode != "sampled_frames" and cfg.get("native_protocol") == "gemini"
+    if video is not None and video_input_mode == "native_video" and not native_video:
+        raise ValueError("native_video is supported only by the Gemini provider; select sampled_frames for this provider.")
+    if native_video and "gemini" not in model_name.lower():
+        raise ValueError("Native video requires a Gemini video-capable model; select sampled_frames for Gemma.")
+    return cfg, native_video
+
+
+def write_prompt_api(
+    *,
+    provider: str,
+    model_name: str,
+    system_prompt: str = "None",
+    custom_system_prompt: str = "",
+    user_prompt: str = "",
+    context: str = "",
+    style: str = "",
+    width: int = 0,
+    height: int = 0,
+    images_b64: list[str] | None = None,
+    output_format: str = "text",
+    split_output: bool = True,
+    max_tokens: int = 4096,
+    temperature: float = 0.7,
+    top_p: float = 0.9,
+    top_k: int = 0,
+    presence_penalty: float = 0.0,
+    frequency_penalty: float = 0.0,
+    seed: int = 0,
+    stop_sequences: str = "",
+    gemini_thinking_budget: int = 0,
+    gemini_thinking_level: str = "None",
+    enable_caching: bool = False,
+    disable_thinking: bool = True,
+    timeout_seconds: int = 120,
+    auto_settings: bool = True,
+    reasoning_effort: str = "low",
+    server_url: str = "",
+    validate: str = "off",
+    frames: int = 0,
+    video=None,
+    video_input_mode: str = "auto",
+    video_sample_frames: int = 32,
+    gemini_video_fps: float = 2.0,
+    quality: str = "custom",
+    min_p: float = 0.0,
+    repeat_penalty: float = 1.0,
+    context_length: int = 8192,
+    unload_after_run: bool = True,
+    audio=None,
+) -> tuple[str, str, str]:
+    """The Luna-LLMPromptAPI writer: build the messages, call the provider, clean and split.
+
+    Returns (positive, negative, log). The node's execute() is this call plus its tensor
+    work (image / sampled-frame encoding and the image-dims canvas fallback); luna_writer_api
+    calls it in-process. Every default equals the node's widget default
+    (tests/test_writer_api_core.py pins this).
+
+    images_b64: base64 PNGs (the Claude CLI declares image/png). width/height drive the
+    canvas block; no fallback to the images' size is made here. video: a VIDEO object, for
+    native Gemini only; sampled frames go in images_b64, so video_sample_frames (the node's
+    sampling setting) is not used here. disable_thinking is accepted and unused, as on the
+    node. quality: a level from QUALITY_OPTIONS sets the reasoning level over the widgets;
+    "custom" (the default here, so luna_writer_api callers are unchanged) keeps them.
+    Figures of the run land in _run_stats() for the node face. min_p, repeat_penalty,
+    context_length and unload_after_run are LM Studio's. audio: a ComfyUI AUDIO dict, for the
+    routes in AUDIO_PROTOCOLS only.
+    """
+    cfg, native_video = _video_route(provider, model_name, video, video_input_mode)
+    if video is not None and not native_video:
+        raise ValueError("write_prompt_api takes `video` only for native Gemini; "
+                         "send sampled frames as images_b64 instead.")
+    audio_clips = _audio_to_wav(audio)
+    if audio_clips and cfg.get("native_protocol") not in AUDIO_PROTOCOLS:
+        raise ValueError(
+            f"{provider} cannot take audio. Audio input works with Gemini and Gemini (Antigravity) "
+            "(tested 2026-10-12: Grok, OpenAI, Codex and LM Studio reject it). Pick one of those "
+            "providers or disconnect the audio input.")
+    if audio_clips and "gemma" in (model_name or "").lower():
+        raise ValueError("Gemma on the Gemini API does not take audio; pick a Gemini model.")
+    _run_stats().clear()
+
+    level = _quality_settings(provider, model_name, quality)
+    if level is not None:
+        reasoning_effort = level.get("reasoning_effort", reasoning_effort)
+        gemini_thinking_level = level.get("gemini_thinking_level", gemini_thinking_level)
+        print(f"[Luna-LLMPromptAPI] quality={quality} -> "
+              + (", ".join(f"{k}={v}" for k, v in level.items()) or "nothing to set for this model"))
+    _note_run(quality=(quality or "custom").lower(), level=", ".join(level.values()) if level else "")
+
+    # Official sampling values for the model family, applied server-side on
+    # every run. The frontend cannot do this job: a JS preset only fires on a
+    # manual dropdown click, so on workflow load the sliders keep stale
+    # values — the same bug the local node was fixed for.
+    if auto_settings:
+        thinking_on = (cfg.get("native_protocol") == "lmstudio" and level is not None
+                       and (quality or "").lower() != "fast")
+        resolved = _resolve_model_settings((model_name or "").lower(), thinking=thinking_on)
+        if resolved:
+            temperature = resolved["temperature"]
+            top_p = resolved["top_p"]
+            top_k = resolved["top_k"]
+            presence_penalty = resolved["presence_penalty"]
+            # min_p / repetition_penalty: only LM Studio takes them (every
+            # cloud provider rejects both), so only its sender reads them.
+            min_p = resolved.get("min_p", min_p)
+            repeat_penalty = resolved.get("repetition_penalty", repeat_penalty)
+            print(
+                f"[Luna-LLMPromptAPI] auto_settings -> temp={temperature}, top_p={top_p}, "
+                f"top_k={top_k}, presence_penalty={presence_penalty}"
+            )
+        else:
+            print(
+                f"[Luna-LLMPromptAPI] auto_settings ON but no published preset for "
+                f"'{model_name}' — using the slider values as-is."
+            )
+
+    base_url = _resolve_base_url(provider, server_url)
+    # Keys are NEVER passed via node widgets — read only from env / .env
+    resolved_key = _resolve_api_key(provider)
+    if cfg.get("needs_auth") and not resolved_key:
+        spec = cfg.get("env_var")
+        names = spec if isinstance(spec, list) else [spec or "<none>"]
+        primary = names[0]
+        alt_text = f" (or any of: {', '.join(names[1:])})" if len(names) > 1 else ""
+        env_path = _comfyui_root() / ".env"
+        raise RuntimeError(
+            f"{provider} requires an API key. Two ways to set it:\n"
+            f"  1. Set the {primary} environment variable{alt_text} BEFORE launching ComfyUI "
+            f"(env vars set after ComfyUI starts are NOT picked up by Easy-Install builds), OR\n"
+            f"  2. Create a .env file at {env_path} with the line:\n"
+            f"     {primary}=your_key_here\n\n"
+            f"The node intentionally has NO api_key widget — widget values are saved to "
+            f"workflow JSON and would leak the key if you shared the workflow.\n\n"
+            f"Check the ComfyUI startup log for '[Luna-LLMPromptAPI] API key environment check:' "
+            f"to see exactly which keys this Python process sees."
+        )
+
+    # Resolve system prompt
+    if custom_system_prompt and custom_system_prompt.strip():
+        sys_prompt = custom_system_prompt.strip()
+    elif system_prompt and system_prompt != "None":
+        prompts = load_system_prompts()
+        sys_prompt = prompts.get(system_prompt, "")
+    else:
+        sys_prompt = ""
+
+    # Grok: use json_schema with strict=true to guarantee positive/negative
+    # split — text format instructions are unreliable with Grok.
+    # Detected here (before tails are appended) so we can choose the right tail.
+    grok_pair_schema: dict | None = None
+    if (
+        provider == "Grok (xAI)"
+        and output_format == "text"
+        and sys_prompt
+        and "|" in sys_prompt
+        and "negative" in sys_prompt.lower()
+    ):
+        grok_pair_schema = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "prompt_pair",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "positive": {
+                            "type": "string",
+                            "description": "The positive image generation prompt",
+                        },
+                        "negative": {
+                            "type": "string",
+                            "description": "The negative image generation prompt",
+                        },
+                    },
+                    "required": ["positive", "negative"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+    # Output-format directive (light hint; JSON is also forced at API level via response_format)
+    if output_format == "json":
+        sys_prompt += (
+            "\n\nReturn only the final prompt as a valid JSON object. "
+            "No preface, no explanations, no markdown fences."
+        )
+    elif output_format == "list":
+        sys_prompt += (
+            "\n\nOutput only the numbered list as specified. "
+            "No preface, no explanations, no markdown fences. "
+            "Keep every item on its own numbered line."
+        )
+    elif sys_prompt:
+        if grok_pair_schema:
+            # Tell Grok to fill JSON fields — "no JSON" would contradict the schema
+            sys_prompt += (
+                "\n\nOutput the positive prompt in the \"positive\" field "
+                "and the negative prompt in the \"negative\" field. "
+                "No extra text outside the JSON."
+            )
+        else:
+            sys_prompt += (
+                "\n\nReturn only the final prompt text. "
+                "No preface, no explanations, no JSON, no markdown fences."
+            )
+            # Authoritative positive/negative delimiter contract (identical to
+            # the GGUF node). Labelled markers survive where a bare '|' gets
+            # dropped; the shared parser strips them so outputs stay clean.
+            if split_output:
+                sys_prompt += (
+                    "\n\nIf your instructions produce a NEGATIVE prompt, format your entire "
+                    "answer EXACTLY like this, each marker on its own line:\n"
+                    "[POSITIVE]\n<the full positive prompt>\n[NEGATIVE]\n<the full negative prompt>\n"
+                    "Write nothing before [POSITIVE] and nothing after the negative prompt. "
+                    "If there is no negative prompt, write [POSITIVE] then your prompt and stop."
+                )
+
+    # Canvas dims. The node's execute() has already applied its image-dims
+    # fallback, so composition stays aspect-ratio-driven.
+    eff_w, eff_h = width, height
+
+    # Build user prompt — STABLE FIRST, VARIABLE LAST for cache friendliness.
+    # LEAD with the aspect-ratio canvas profile, then STYLE -> USER REQUEST.
+    stable_parts: list[str] = []
+    if eff_w > 0 and eff_h > 0:
+        canvas_block = _build_canvas_profile(eff_w, eff_h)
+        if canvas_block:
+            stable_parts.append(canvas_block)
+    if style and style.strip():
+        stable_parts.append(f"STYLE:\n{style.strip()}")
+
+    variable_parts: list[str] = []
+    # Upstream analysis (stage 1 of a two-stage graph). Variable, not stable:
+    # it changes every run, so it must stay OUT of the Gemini cache prefix.
+    if context and context.strip():
+        variable_parts.append(f"REFERENCE CONTEXT:\n{context.strip()}")
+    if user_prompt and user_prompt.strip():
+        variable_parts.append(f"USER REQUEST:\n{user_prompt.strip()}")
+
+    all_parts = stable_parts + variable_parts
+    final_user_prompt = "\n\n".join(all_parts) if all_parts else "Describe a scene vividly."
+
+    # Stable text for Gemini caching purposes (system + stable user portion)
+    stable_user_text = "\n\n".join(stable_parts)
+
+    # Vision content: base64 PNGs, already encoded by the caller. Empty
+    # entries are dropped, as the node always did.
+    images_b64 = [b for b in (images_b64 or []) if b]
+    media_log = ""
+    if native_video:
+        media_log = f"Video: native Gemini clip with embedded audio if present; sampling {gemini_video_fps:g} fps."
+
+    # Build messages array
+    messages: list[dict] = []
+    if sys_prompt:
+        messages.append({"role": "system", "content": sys_prompt})
+
+    if images_b64:
+        user_content = _build_multimodal_user_content(final_user_prompt, images_b64)
+        messages.append({"role": "user", "content": user_content})
+    else:
+        messages.append({"role": "user", "content": final_user_prompt})
+
+    # Build sampling dict
+    sampling = {
+        "temperature": float(temperature),
+        "top_p": float(top_p),
+        "top_k": int(top_k),
+        "presence_penalty": float(presence_penalty),
+        "frequency_penalty": float(frequency_penalty),
+        "max_tokens": int(max_tokens),
+        "seed": int(seed),
+    }
+
+    # Parse stop sequences
+    stops: list[str] = []
+    if stop_sequences and stop_sequences.strip():
+        stops = [s.strip() for s in stop_sequences.split(",") if s.strip()]
+
+    # Send the request — route Gemini through its native API for full
+    # feature support (thinking_budget, safety, top_k, caching). Other
+    # providers go through the OpenAI-compatible /v1/chat/completions path.
+    _cli = cfg.get("native_protocol")
+    if _cli in ("claude_cli", "codex_cli", "grok_cli"):
+        _send = {"claude_cli": _send_claude_cli, "codex_cli": _send_codex_cli,
+                 "grok_cli": _send_grok_cli}[_cli]
+        raw = _send(model_name, messages, float(timeout_seconds), reasoning_effort)
+    elif _cli == "agy_cli":
+        raw = _send_agy_cli(model_name, messages, float(timeout_seconds), reasoning_effort,
+                            audio=[(b, "wav") for b in audio_clips])
+    elif _cli == "lmstudio":
+        raw = _send_lmstudio(
+            base_url=base_url, api_key=resolved_key, model=model_name, messages=messages,
+            sampling={**sampling, "min_p": float(min_p), "repeat_penalty": float(repeat_penalty)},
+            timeout=float(timeout_seconds), reasoning_effort=reasoning_effort,
+            context_length=int(context_length), unload_after_run=bool(unload_after_run))
+    elif cfg.get("native_protocol") == "gemini":
+        # Caching: create or reuse a cached content resource for the stable prefix
+        cache_name: str | None = None
+        if enable_caching and resolved_key and sys_prompt and stable_user_text:
+            cache_name = _gemini_create_cached_content(
+                api_key=resolved_key,
+                model=model_name,
+                system_text=sys_prompt,
+                stable_user_text=stable_user_text,
+            )
+            if cache_name:
+                print(f"[Luna-LLMPromptAPI] Using Gemini cached content: {cache_name}")
+
+        raw = _send_gemini_native(
+            base_url=base_url,
+            api_key=resolved_key,
+            model=model_name,
+            messages=messages,
+            sampling=sampling,
+            output_format=output_format,
+            stop_sequences=stops,
+            thinking_budget=gemini_thinking_budget,
+            thinking_level=gemini_thinking_level,
+            cached_content_name=cache_name,
+            timeout=float(timeout_seconds),
+            video=video if native_video else None,
+            video_fps=gemini_video_fps,
+            include_thoughts=level is not None,
+            audio=audio_clips,
+        )
+    else:
+        raw = _send_chat_completion(
+            provider=provider,
+            base_url=base_url,
+            api_key=resolved_key,
+            model=model_name,
+            messages=messages,
+            sampling=sampling,
+            output_format=output_format,
+            stop_sequences=stops,
+            timeout=float(timeout_seconds),
+            extra_body=None,
+            response_format_override=grok_pair_schema,
+            reasoning_effort=reasoning_effort,
+        )
+
+    if grok_pair_schema:
+        # Grok returned a guaranteed JSON object — assemble positive|negative directly.
+        # No text cleaning needed; the schema enforces clean string fields.
+        try:
+            pair = json.loads(raw)
+            positive = str(pair.get("positive") or "").strip()
+            negative = str(pair.get("negative") or "").strip()
+            cleaned = f"{positive}|{negative}" if negative else positive
+        except Exception as e:
+            print(f"[Luna-LLMPromptAPI] Grok JSON parse failed ({e}), falling back to text cleaning")
+            cleaned = clean_model_output(raw, OutputCleanConfig(mode="prompt")) or raw
+            cleaned = normalize_prompt_separator(cleaned)
+    elif output_format == "text":
+        # The shared hardened split_positive_negative() below handles markers,
+        # labels, pipe and JSON, so the old normalize-to-pipe pre-pass is gone.
+        cleaned = clean_model_output(raw, OutputCleanConfig(mode="prompt")) or raw
+    else:
+        cleaned = raw
+
+    # Split 'positive|negative' into the two outputs (or full text on
+    # positive + empty negative when split_output is off / no pipe).
+    positive, negative = split_positive_negative(cleaned, split_output)
+
+    log = ""
+    if validate == "h3":
+        positive, findings = validate_h3(positive, frames or None)
+        log = format_log(positive, frames or None, findings)
+        print(f"[Luna-LLMPromptAPI] {log}")
+    if media_log:
+        print(f"[Luna-LLMPromptAPI] {media_log}")
+        log = "\n".join(part for part in (media_log, log) if part)
+
+    return positive, negative, log
+
+
+# ---------------------------------------------------------------------------
+# The Node
+# ---------------------------------------------------------------------------
+
+class LLMPromptAPINode(io.ComfyNode):
+    """Prompt generation via OpenAI-compatible API (Gemini, Grok, Custom).
+
+    Zero llama-cpp-python dependency. Just HTTP.
+    """
+
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        prompts = load_system_prompts()
+        prompt_names = ["None"] + sorted(prompts.keys())
+        providers = list(PROVIDERS.keys())
+        default_provider = providers[0]
+
+        # CRITICAL: ComfyUI validates the model_name value against this list
+        # server-side. The JS extension changes the *visible* options when the
+        # user picks a provider, but the validator uses what's returned here.
+        # So we must return a SUPERSET of all possible model names across all
+        # providers — otherwise picking e.g. a Grok model fails validation
+        # because it isn't in Gemini's list.
+        all_models: list[str] = []
+        for prov_name, prov_cfg in PROVIDERS.items():
+            all_models.extend(prov_cfg.get("fallback_models") or [])
+        # The providers' live lists, so the JS dropdown's models pass server-side
+        # validation. Cached: ComfyUI calls this on every queue, several times.
+        all_models.extend(_schema_live_models())
+        # LM Studio's last-seen models, for when its server is down at start.
+        all_models.extend((_check_load().get("_lmstudio") or {}).get("models") or [])
+        # Dedupe while preserving order
+        seen: set[str] = set()
+        model_options: list[str] = []
+        for m in all_models:
+            if m and m not in seen:
+                seen.add(m)
+                model_options.append(m)
+        if not model_options:
+            model_options = ["<no models available>"]
+
+        return io.Schema(
+            node_id="Luna-LLMPromptAPI",
+            display_name="Luna-LLMPromptAPI",
+            category="Luna-LLM-Tools",
+            description=(
+                "Prompt writing with cloud models (Gemini, Grok, OpenAI), local models through "
+                "LM Studio, your subscriptions (Claude Max, Codex, SuperGrok, Gemini via "
+                "Antigravity) or any OpenAI-compatible server. Outputs positive / negative."
+            ),
+            inputs=[
+                # ===== BASIC =====
+                io.Combo.Input("provider", options=providers, default=default_provider,
+                               tooltip="Which backend to call. Gemini / Grok / OpenAI = cloud APIs (need an API key in an env var or a .env at the ComfyUI root). LM Studio = local models through LM Studio's server (127.0.0.1:1234). Claude (Max), Codex (ChatGPT), Grok (SuperGrok), Gemini (Antigravity) = your subscriptions through their CLIs. Custom = any OpenAI-compatible endpoint (set server_url)."),
+                io.Combo.Input("model_name", options=model_options,
+                               tooltip="Available models. Gemini fetches your account's accessible models. Grok shows the curated list (no /models endpoint). Refreshes when the provider changes."),
+                io.String.Input("server_url", default="",
+                                tooltip="Override the provider's default URL. Required for the Custom provider. Leave empty to use the provider default."),
+                io.Combo.Input("model_filter", options=["all", "text only", "vision", "multimodal"], default="all",
+                               tooltip="Filter the model dropdown by capability. 'vision' shows models that accept images. 'multimodal' shows models accepting multiple input types."),
+                io.Combo.Input("system_prompt", options=prompt_names, default=prompt_names[0],
+                               tooltip="System prompt preset loaded from prompts/*.md. Choose None to use only custom_system_prompt."),
+                io.String.Input("custom_system_prompt", multiline=True, default="",
+                                tooltip="Override the preset. If non-empty, replaces whatever the preset would have been."),
+                io.String.Input("user_prompt", multiline=True, default="",
+                                tooltip="Your scene concept, subject, idea."),
+                io.Combo.Input("output_format", options=["text", "json", "list"], default="text",
+                               tooltip="text = plain prompt paragraph. json = forced JSON output. list = numbered multi-scene list (for LTX video tracks)."),
+                io.Boolean.Input("split_output", default=True,
+                                 tooltip="ON splits a 'positive | negative' result into the two outputs. OFF = full text on positive, negative empty. Uses the same bulletproof marker contract as the GGUF node."),
+                io.Int.Input("max_tokens", default=4096, min=64, max=32000,
+                             tooltip="Ceiling on the reply length, not a target — the model stops when it is done. Rough sizes: an H3 prompt at 350-500 words is ~800-1200 tokens; a Vision Reader block is ~150 per image. 4096 covers both with room to spare. Raise it only for long multi-scene lists. Too LOW is the dangerous direction — the reply is cut off mid-sentence."),
+                io.Int.Input("seed", default=0, min=0, max=2**32 - 1,
+                             tooltip="Random seed. 0 = non-deterministic (the provider picks). Cloud APIs treat this as best-effort."),
+
+                # ===== ADVANCED (collapsed by default) =====
+                io.Float.Input("temperature", default=0.7, min=0.0, max=2.0, step=0.05, advanced=True,
+                               tooltip="Sampling randomness. Lower = focused, higher = creative. 0.7 is the sane default for prompt writing; 1.0 means the same brief writes a different prompt every run. Overridden when auto_settings is ON and the model family is known."),
+                io.Float.Input("top_p", default=0.9, min=0.0, max=1.0, step=0.05, advanced=True,
+                               tooltip="Nucleus sampling. Gemma 4: 0.95. Qwen 3 instruct: 0.8. Qwen-VL: 0.9. Overridden when auto_settings is ON."),
+                io.Int.Input("top_k", default=0, min=0, max=200, advanced=True,
+                             tooltip="Top-K. 0 = disabled. Gemini's native API genuinely honours it — that is why it survived the 2026-08-31 cleanup that removed min_p and repetition_penalty. Grok and OpenAI reject it and it is stripped automatically. OpenAI additionally only accepts sampling at reasoning_effort=none."),
+                io.Float.Input("presence_penalty", default=0.0, min=-2.0, max=2.0, step=0.1, advanced=True,
+                               tooltip="Discourages reusing tokens. Gemini's native API ignores it. On OpenAI GPT-5.6 it is accepted ONLY at reasoning_effort=none — at any other level it 400s, so the node strips it."),
+                io.Float.Input("frequency_penalty", default=0.0, min=-2.0, max=2.0, step=0.1, advanced=True,
+                               tooltip="Discourages repeating frequent tokens. 0.0 = disabled. Gemini's native API ignores it. On OpenAI GPT-5.6, same rule as presence_penalty — reasoning_effort=none only."),
+                io.String.Input("stop_sequences", default="", advanced=True,
+                                tooltip="Comma-separated strings that stop generation. Example: 'END,---,EOF'. Empty = default."),
+                io.Int.Input("gemini_thinking_budget", default=0, min=0, max=24576, advanced=True,
+                             tooltip="GEMINI 2.5 AND OLDER ONLY. Reasoning tokens before answering; 0 = no thinking, which is what you want for prompt writing. The node picks the right field for you: Gemini 2.5 gets this, Gemini 3 gets thinking_level below, Gemma gets neither (it rejects both). Nothing to guess — this widget is simply ignored unless the model is a 2.5."),
+                io.Combo.Input("gemini_thinking_level", options=["None", "low", "medium", "high"], default="None", advanced=True,
+                               tooltip="GEMINI 3 ONLY, all tiers. Reasoning depth; None = 'low', the nearest thing to off and the right choice for prompt writing. Ignored unless the model is a Gemini 3 — see the budget widget above."),
+                io.Boolean.Input("enable_caching", default=False, advanced=True,
+                                 tooltip="Gemini only. Caches the stable prefix (system + style + canvas) to cut cost on repeated variations. Needs a ~1024+ token prefix."),
+                io.Boolean.Input("disable_thinking", default=True, advanced=True,
+                                 tooltip="Strips any <think> reasoning from the OUTPUT as a safety net. For Gemini, set the thinking budget/level to 0/None to disable at the source."),
+                io.Int.Input("timeout_seconds", default=120, min=5, max=600, advanced=True,
+                             tooltip="HTTP timeout for the chat call. Raise to 180+ for big reasoning models."),
+                io.Float.Input("vision_mp", default=0.0, min=0.0, max=8.0, step=0.1, advanced=True,
+                               tooltip="Downscale input images to at most this many megapixels before encoding. 0 = off (send at full size). ~1.0 is plenty for reference reading and saves context and time."),
+                io.Combo.Input("validate", options=["off", "h3"], default="off", advanced=True,
+                               tooltip="Check the output's format and report findings on the `log` output. 'h3' checks MiniMax H3 prompts: section names and order, no mixing of the 3-field and 6-section formats, shot numbering, cut timestamps, labels, dialogue tags. Only the S.SS in an alignment line is repaired, and only when `frames` is wired."),
+                # NEW WIDGETS GO AT THE END OF THIS LIST, NEVER IN THE MIDDLE.
+                # Saved workflows store widget values positionally, so inserting
+                # one shifts every value after it and corrupts existing graphs.
+                io.Boolean.Input("auto_settings", default=True, advanced=True,
+                                 tooltip="ON = the node sets temperature / top_p / top_k / presence_penalty to the official values for the chosen model family, every run, ignoring the sliders above. Gemma 4: 1.0 / 0.95 / 64. Qwen 3 instruct: 0.7 / 0.8 / 20. Qwen-VL: 0.7 / 0.9 / 20. Gemini, Grok and OpenAI have no published table - for those the sliders are used as-is and the console says so. OFF = your slider values always."),
+                io.Combo.Input("reasoning_effort", options=["none", "low", "medium", "high", "xhigh", "default"], default="low", advanced=True,
+                               tooltip="GROK 4.5 / 4.6 / 4.20-multi-agent and OPENAI GPT-5.6 only; ignored by Gemini and everything else.\n\nGROK: reasoning CANNOT be turned off - 'low' is the floor and the right pick for prompt writing, so it is the default. 'none' is clamped to 'low'. 'xhigh' needs grok-4.6+; on 4.5 the node sends 'high'. 'default' sends NOTHING and lets xAI pick, which is 'high' - that cost 75-110s per prompt on grok-4.6 (2026-08-29), so choose it deliberately.\n\nOPENAI GPT-5.6: accepts none/low/medium/high/xhigh (NOT 'minimal', NOT 'max' - both 400, whatever the guide says). IMPORTANT: temperature, top_p and the penalties are accepted ONLY at 'none'. Pick 'none' for plain prompt writing and keep your sliders; pick 'medium'/'high' for structured work like the MinimaxH3 presets and accept fixed sampling."),
+
+                # ===== Optional connections =====
+                io.String.Input("style", optional=True, force_input=True,
+                                tooltip="Style description from an external node."),
+                io.String.Input("context", optional=True, force_input=True,
+                                tooltip="Upstream analysis from another node (e.g. a vision-reader Luna-LLMPrompt). Appended as its own labelled block ahead of your request."),
+                io.Int.Input("width", optional=True, force_input=True,
+                             tooltip="Image width - drives an aspect-ratio composition profile."),
+                io.Int.Input("height", optional=True, force_input=True,
+                             tooltip="Image height - drives an aspect-ratio composition profile."),
+                io.Image.Input("image", optional=True, tooltip="Input image for vision-capable models."),
+                io.Video.Input("video", optional=True, tooltip="Gemini native mode sends the clip including its audio. Sampled-frame mode sends still images only."),
+                io.Audio.Input("audio", optional=True,
+                               tooltip="An audio clip for the model to listen to (up to 15 min). Works with "
+                                       "Gemini and Gemini (Antigravity); Grok, OpenAI, Codex, Claude and "
+                                       "LM Studio cannot take audio and stop with a message."),
+                io.Int.Input("frames", optional=True, force_input=True,
+                             tooltip="The clip's real frame count, for `validate`. Lets S.SS and the cut times be checked against the actual duration instead of just their format."),
+                io.Combo.Input("video_input_mode", options=["auto", "native_video", "sampled_frames"], default="auto",
+                               tooltip="auto: native video with embedded audio for Gemini; sampled stills for other providers. native_video requires Gemini and a VIDEO object. sampled_frames discards audio."),
+                io.Int.Input("video_sample_frames", default=32, min=1, max=256,
+                             tooltip="Maximum evenly spaced still frames in sampled_frames mode. Separate from the target clip's frames validation input. Higher counts increase request size and cost."),
+                io.Float.Input("gemini_video_fps", default=2.0, min=0.1, max=24.0, step=0.1,
+                               tooltip="Gemini native video sampling rate, in frames per second. Audio remains in the uploaded clip. Higher rates increase token use; ignored in sampled_frames mode."),
+                # Last in the list: saved workflows store widget values by
+                # position. Optional so old API-format prompts still validate;
+                # a missing value runs as "custom" (the execute() default).
+                io.Combo.Input("quality", options=QUALITY_OPTIONS, default="fast", optional=True,
+                               tooltip="Prompt quality: sets the reasoning level the provider gets. "
+                                       "fast = the lowest (Gemini minimal or low, OpenAI none, Grok low). "
+                                       "normal / quality / ultra = more reasoning, slower. "
+                                       "custom = use reasoning_effort and gemini_thinking_level as set. "
+                                       "Gemma and Custom servers have no reasoning control."),
+                # LM Studio only (2026-10-12). Cloud providers reject min_p and
+                # repeat penalties, so only the LM Studio route sends them.
+                io.Float.Input("min_p", default=0.0, min=0.0, max=1.0, step=0.01, advanced=True,
+                               tooltip="LM Studio only. Minimum token probability. Overridden when auto_settings is ON and the model family is known."),
+                io.Float.Input("repeat_penalty", default=1.0, min=1.0, max=2.0, step=0.01, advanced=True,
+                               tooltip="LM Studio only. 1.0 = off. Overridden when auto_settings is ON and the model family is known."),
+                io.Int.Input("context_length", default=8192, min=0, max=262144, step=1024, advanced=True,
+                             tooltip="LM Studio only: the context to load a model with when this node loads it. 0 = the model's LM Studio default. A model that is already loaded (by you or Luna Bridge) is used as it is - a different value would make LM Studio load a second copy."),
+                io.Boolean.Input("unload_after_run", default=True, advanced=True,
+                                 tooltip="LM Studio only. ON = unload the model after the run, but only if this run loaded it. A model that was already loaded stays loaded."),
+            ],
+            outputs=[
+                io.String.Output("positive", display_name="positive"),
+                io.String.Output("negative", display_name="negative"),
+                io.String.Output("log", display_name="log"),
+            ],
+        )
+
+    @classmethod
+    def fingerprint_inputs(cls, **kwargs):
+        return float("nan")
+
+    # ------------------------------------------------------------------
+    # Entry point
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def execute(
+        cls,
+        provider: str,
+        model_name: str,
+        server_url: str,
+        model_filter: str,
+        system_prompt: str,
+        custom_system_prompt: str,
+        user_prompt: str,
+        output_format: str,
+        split_output: bool,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        presence_penalty: float,
+        frequency_penalty: float,
+        seed: int,
+        stop_sequences: str,
+        gemini_thinking_budget: int,
+        gemini_thinking_level: str,
+        enable_caching: bool,
+        disable_thinking: bool,
+        timeout_seconds: int,
+        auto_settings: bool = True,
+        # "low" so workflows saved BEFORE this widget existed also get the fast
+        # path — they send no value, so this Python default is what they use.
+        # Renamed from grok_reasoning_effort on 2026-08-31 when OpenAI joined;
+        # the widget kept its position, so saved values still map correctly.
+        reasoning_effort: str = "low",
+        vision_mp: float = 0.0,
+        validate: str = "off",
+        style: str = "",
+        context: str = "",
+        width: int = 0,
+        height: int = 0,
+        image=None,
+        video=None,
+        frames: int = 0,
+        video_input_mode: str = "auto",
+        video_sample_frames: int = 32,
+        gemini_video_fps: float = 2.0,
+        quality: str = "custom",
+        min_p: float = 0.0,
+        repeat_penalty: float = 1.0,
+        context_length: int = 8192,
+        unload_after_run: bool = True,
+        audio=None,
+    ):
+        # Provider and video-mode errors first, as before the writer core existed.
+        _cfg, native_video = _video_route(provider, model_name, video, video_input_mode)
+
+        # Effective canvas dims: wired width/height, else the input image's dims,
+        # so composition is ALWAYS aspect-ratio-driven.
+        eff_w, eff_h = width, height
+        if (eff_w <= 0 or eff_h <= 0) and image is not None:
+            try:
+                eff_h, eff_w = int(image.shape[1]), int(image.shape[2])
+            except Exception:
+                pass
+
+        # Vision content. Guard against a disabled/empty upstream (e.g. a bypassed
+        # image loader): treat a missing or zero-length tensor as "no image" -> t2i.
+        images_b64: list[str] = []
+        if image is not None and getattr(image, "shape", (0,))[0] > 0:
+            for i in range(image.shape[0]):
+                img = _tensor_to_base64_png(image[i], max_mp=vision_mp)
+                if img:
+                    images_b64.append(img)
+        sampled_log = ""
+        if video is not None and not native_video:
+            if not 1 <= int(video_sample_frames) <= 256:
+                raise ValueError("video_sample_frames must be between 1 and 256.")
+            video_images = video.get_components().images if callable(getattr(video, "get_components", None)) else video
+            sampled = _sample_video_frames(video_images, video_sample_frames)
+            sampled_log = f"Video: {len(sampled)} sampled still frames; audio is not sent."
+            for frame in sampled:
+                img = _tensor_to_base64_png(frame, max_mp=vision_mp)
+                if img:
+                    images_b64.append(img)
+
+        positive, negative, log = write_prompt_api(
+            provider=provider, model_name=model_name, system_prompt=system_prompt,
+            custom_system_prompt=custom_system_prompt, user_prompt=user_prompt,
+            context=context, style=style, width=eff_w, height=eff_h, images_b64=images_b64,
+            output_format=output_format, split_output=split_output, max_tokens=max_tokens,
+            temperature=temperature, top_p=top_p, top_k=top_k,
+            presence_penalty=presence_penalty, frequency_penalty=frequency_penalty, seed=seed,
+            stop_sequences=stop_sequences, gemini_thinking_budget=gemini_thinking_budget,
+            gemini_thinking_level=gemini_thinking_level, enable_caching=enable_caching,
+            disable_thinking=disable_thinking, timeout_seconds=timeout_seconds,
+            auto_settings=auto_settings, reasoning_effort=reasoning_effort,
+            server_url=server_url, validate=validate, frames=frames,
+            video=video if native_video else None, video_input_mode=video_input_mode,
+            video_sample_frames=video_sample_frames, gemini_video_fps=gemini_video_fps,
+            quality=quality, min_p=min_p, repeat_penalty=repeat_penalty,
+            context_length=context_length, unload_after_run=unload_after_run, audio=audio,
+        )
+        # Sampled frames are this node's work, so their log line is added here,
+        # ahead of the validation report, as before.
+        if sampled_log:
+            print(f"[Luna-LLMPromptAPI] {sampled_log}")
+            log = "\n".join(part for part in (sampled_log, log) if part)
+
+        # The node face reads these in onExecuted: the last-run line and its
+        # "view thinking" link.
+        stats = dict(_run_stats())
+        reasoning = stats.pop("reasoning", "")
+        stats.update(provider=provider, model=model_name)
+        ui = {"llm_stats": [stats]}
+        if reasoning:
+            ui["llm_reasoning"] = [reasoning]
+        return io.NodeOutput(positive, negative, log, ui=ui)
+
+
+# ---------------------------------------------------------------------------
+# ComfyUI registration
+# ---------------------------------------------------------------------------
+
+NODE_CLASS_MAPPINGS = {
+    "Luna-LLMPromptAPI": LLMPromptAPINode,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "Luna-LLMPromptAPI": "Luna-LLMPromptAPI",
+}

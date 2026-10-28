@@ -1,0 +1,41 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Secrets: never commit API keys
+.env
+.env.local
+.env.*.local
+*.key
+*_api_key*
+
+# Live caches, regenerated on demand
+.gemini_models.json
+.api_models_check.json
+
+# Private system prompts (not shipped)
+prompts/private/
+
+node_modules/
+
+# Local context files, not for git
+CLAUDE.md
+STATUS.md
+AGENTS.md
+SPEC.md
+BUILD.md
+plans/
+design/
+.claude/
+.codex/
+.agents/
+# Agent scratch, deleted after use (see AGENTS.md).
+.work/
