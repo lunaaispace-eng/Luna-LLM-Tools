@@ -47,11 +47,14 @@ Each node needs only its own part:
 
 ## Replaces
 
-Luna-LLM-Tools replaces LLM_Prompt and ComfyUI-StylePromptLibrary.
-Node ids changed with the rename (for example `LLMPromptAPI` is now `Luna-LLMPromptAPI`), so workflows saved with the old nodes need those nodes swapped for the new ones. Server routes
-(`/llm_prompt/...`, `/llm_prompt_api/...`, the style library's), API-key variable names and model folders are
-unchanged, and the `luna_writer_api` module that ComfyUI-LunaStudio imports is still registered. Remove the old
-folders from `custom_nodes` when you install this pack.
+Luna-LLM-Tools replaces **LLM_Prompt** and **ComfyUI-StylePromptLibrary**. Parts of
+ComfyUI-LunaBrowser and ComfyUI-GPTImage2 also went into it. Agent Chat and GPT Image Codex are not part of this
+pack.
+
+Node ids changed with the rename (for example `LLMPromptAPI` is now `Luna-LLMPromptAPI`), so workflows saved with
+the old nodes need those nodes swapped for the new ones. Server routes (`/llm_prompt/...`, `/llm_prompt_api/...`,
+the style library's), API-key variable names and model folders are unchanged, and the `luna_writer_api` module that
+ComfyUI-LunaStudio imports is still registered. Remove the old folders from `custom_nodes` when you install this pack.
 
 ## More documentation
 
@@ -67,7 +70,7 @@ python -m pytest tests
 
 Run with ComfyUI's Python; the tests import ComfyUI (`COMFYUI_DIR`, default `E:\ComfyUI-Easy-Install\ComfyUI`) and
 skip when it is missing. None calls a paid API. `tools/test_gemini_video.py` is a unittest file run with
-`python -m unittest discover -s tools -p "test_*.py"`.
+`python -m unittest discover -s tools -p "test_*.py"`; it needs `google-genai` and has a known failure.
 
 ## Licence
 
