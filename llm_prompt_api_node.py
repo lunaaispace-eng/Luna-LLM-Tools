@@ -998,15 +998,13 @@ def _diagnose_env_keys() -> None:
         for name in names:
             v = os.environ.get(name)
             if v:
-                # Show only first 8 chars + length — don't leak the full key
-                preview = f"{v[:8]}…({len(v)} chars)"
-                found.append(f"{name}={preview}")
+                # Never print any part of a key, only that it is set
+                found.append(f"{name}=set")
         # Check .env file too
         file_keys = _load_env_file_keys()
         for name in names:
             if name in file_keys and name not in [f.split("=")[0] for f in found]:
-                preview = f"{file_keys[name][:8]}…(.env)"
-                found.append(f"{name}={preview}")
+                found.append(f"{name}=set (.env)")
         if found:
             print(f"  {prov_name}: {', '.join(found)}")
         else:
