@@ -45,11 +45,11 @@ registerLunaHelp(app, [
 ], "LunaLLMTools.Help");
 
 // The chevron beside it folds the settings away, leaving the sockets. Luna-LLMPrompt and
-// Luna-LLMPromptAPI draw their own face (provider buttons, quality cards) on top of ordinary
-// widgets; folding hides the widgets and leaves that face and the sockets. Luna-StylePrompt keeps
-// its picker. The other nodes are ordinary widgets and sockets.
+// Luna-LLMPromptAPI are left out: their gear sits on the same spot of the title bar, and the
+// chevron took its click. Luna-StylePrompt keeps its picker. The other nodes are ordinary
+// widgets and sockets.
 registerLunaCollapse(app, [
-    "Luna-LLMPrompt", "Luna-LLMPromptAPI", "Luna-StylePrompt", "Luna-CombineStyles",
+    "Luna-StylePrompt", "Luna-CombineStyles",
     "Luna-LoadImageForCaption", "Luna-SaveCaption", "Luna-GPTImage",
     "Luna-GeminiImage", "Luna-GeminiOmniVideo", "Luna-GrokImage", "Luna-GrokImageEdit", "Luna-GrokVideo",
     "Luna-GrokVideoReference", "Luna-GrokVideoFrames", "Luna-GrokVideoEdit", "Luna-GrokVideoExtend",

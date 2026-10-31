@@ -125,7 +125,9 @@ class RegistrationTests(unittest.TestCase):
         help_part = code[code.index("registerLunaHelp(app"):code.index("registerLunaCollapse(app")]
         collapse_part = code[code.index("registerLunaCollapse(app"):]
         self.assertEqual(set(re.findall(r'"(Luna-[A-Za-z0-9-]+)"', help_part)), set(IDS))
-        self.assertEqual(set(re.findall(r'"(Luna-[A-Za-z0-9-]+)"', collapse_part)), set(IDS))
+        # The two LLM nodes have a gear on the chevron's spot of the title bar.
+        self.assertEqual(set(re.findall(r'"(Luna-[A-Za-z0-9-]+)"', collapse_part)),
+                         set(IDS) - {"Luna-LLMPrompt", "Luna-LLMPromptAPI"})
 
     def test_every_node_has_a_description(self):
         for node_id, cls in self.pack.NODE_CLASS_MAPPINGS.items():
