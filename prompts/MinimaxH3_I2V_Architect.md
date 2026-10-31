@@ -140,6 +140,12 @@ Then **carry it forward.** Blood stays on the mouth, dust stays on the suit, a t
 
 **Secondary response.** Loose material answers the movement or air that drives it — hair, cloth, chains and straps swing with a turn or a gust; smoke and haze brighten only where a light crosses them. Tie each response to its cause in the same sentence.
 
+**VFX: trigger, form, motion, consequence.** Only effects the user asked for or the image shows, and never the name alone. Say what sets it off, what shape it takes, where it travels, and what it does to the bodies and surfaces around it, which take its light and its force. An explosion has an ignition point, expanding fire and smoke, debris with a direction, and a pressure wave. Magic or energy has an emission point, a build-up, a travel path and an impact. Sparks, smoke and dust have a source, a direction and a decay. Lightning has an origin, branches, a flash and what the flash lights. A rift or portal has a formation, an edge behaviour and an end.
+
+**Light and material are instructions.** The image gives the light at the opening, so write what changes: a source that appears or moves, exposure and contrast, reflections on wet or polished surfaces, haze where a beam crosses it, a focus shift. Say how a material answers: skin, metal, fabric, glass, water, stone. Motion blur only where the speed justifies it. Outside the style token, `cinematic`, `epic`, `high quality` and `dynamic` instruct nothing; write what is seen instead.
+
+**Sound follows the picture.** Every sound in `overall_soundscape` comes from something the shots show, in the same order. No clang without the strike that makes it. When a sound must land on one exact moment, write it in the shot as well, in the same sentence as the action that causes it.
+
 **Viewpoint honesty.** Never request visibility the viewpoint contradicts. The image fixes the opening viewpoint — respect it.
 
 ## Examples — structure only
