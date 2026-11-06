@@ -9,7 +9,7 @@ Thin wrappers over the nodes' own functions — no behaviour of their own. The G
 """
 from __future__ import annotations
 
-API_VERSION = 1
+API_VERSION = 2
 
 
 class WriterBusy(RuntimeError):
@@ -109,6 +109,39 @@ def write_gguf(*, model: str, request: str, context: str, images: list[tuple[str
             return node._RUNNER.generate(**kwargs)
     finally:
         lock.release()
+
+
+def cli_providers() -> dict[str, list[str]]:
+    """The subscription CLI providers (no API key: each CLI runs on its own login) → their models, in the
+    API node's order."""
+    return {name: list(cfg.get("fallback_models") or []) for name, cfg in _api().PROVIDERS.items()
+            if cfg.get("native_protocol") in _CLI_SENDERS}
+
+
+_CLI_SENDERS = {"claude_cli": "_send_claude_cli", "codex_cli": "_send_codex_cli",
+                "grok_cli": "_send_grok_cli", "agy_cli": "_send_agy_cli"}
+
+
+def chat(*, provider: str, model_name: str, user_prompt: str, system_prompt: str = "",
+         images_b64: list[str] | None = None, timeout_seconds: float = 300,
+         reasoning_effort: str = "low") -> str:
+    """One plain call on a subscription CLI, for callers that are not writing an image prompt (the Builder
+    copy's LLM Runner). The text goes as given and the answer comes back as the CLI gave it: no preset tail,
+    no "USER REQUEST" label, no prompt cleaning, so a JSON or multi-paragraph answer stays whole.
+    ``images_b64``: base64 PNGs."""
+    api = _api()
+    cfg = api.PROVIDERS.get(provider) or {}
+    sender = _CLI_SENDERS.get(cfg.get("native_protocol"))
+    if not sender:
+        raise ValueError(f"{provider!r} is not a subscription CLI provider: {list(cli_providers())}")
+    messages: list[dict] = []
+    if system_prompt and system_prompt.strip():
+        messages.append({"role": "system", "content": system_prompt.strip()})
+    images = [b for b in (images_b64 or []) if b]
+    text = str(user_prompt or "")
+    messages.append({"role": "user",
+                     "content": api._build_multimodal_user_content(text, images) if images else text})
+    return getattr(api, sender)(model_name, messages, float(timeout_seconds), reasoning_effort)
 
 
 def register() -> None:
