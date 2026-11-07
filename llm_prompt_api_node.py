@@ -88,6 +88,31 @@ PROVIDERS = {
             # alone — being listed does not mean being callable.
         ],
     },
+    "Gemini (Vertex)": {
+        # Google through Vertex (Agent Platform) with an "API Key Cloud" key
+        # (D:/Claude/Luna-Director-Suite/plans/2026-11-07-vertex-google.md).
+        # Same native sender as Gemini, on the SDK's express client:
+        # genai.Client(vertexai=True, api_key=...) answered 2026-11-07; the SDK
+        # refuses project + key together. No Files API (native video) and no
+        # cached content here. The key cannot list models: a fixed list of the
+        # text models that answered on Vertex (empty-body probe, 2026-11-07).
+        "base_url": "https://aiplatform.googleapis.com/v1/publishers/google",
+        "env_var": ["VERTEX_API_KEY"],
+        "needs_auth": True,
+        "live_models": False,
+        "native_protocol": "gemini",
+        "vertex": True,
+        "fallback_models": [
+            "gemini-3.8-flash",
+            "gemini-3.7-flash",
+            "gemini-3.6-flash",
+            "gemini-3.5-flash",
+            "gemini-3.5-flash-lite",
+            "gemini-3.1-pro-preview",
+            "gemini-3.1-flash-lite",
+            "gemini-3-flash-preview",
+        ],
+    },
     "Grok (xAI)": {
         "base_url": "https://api.x.ai/v1",
         "env_var": ["XAI_API_KEY", "GROK_API_KEY"],
@@ -686,8 +711,9 @@ def _get_models_for_provider(
         # Image models answer generateContent too (gemini-nano-banana-2.1 got
         # through on 2026-10-12); they belong to the Luna-GeminiImage node.
         filtered = [m for m in filtered if "banana" not in m and "-image" not in m]
-        # Models the check found dead or rerouted stay out of the list.
-        hidden = _gemini_hidden_models()
+        # Models the check found dead or rerouted stay out of the list. The check
+        # runs on the Gemini API only; the Vertex list is fixed and was probed.
+        hidden = {} if cfg.get("vertex") else _gemini_hidden_models()
         filtered = [m for m in filtered if m not in hidden] or filtered
         filtered.sort(key=_gemini_sort_key)
 
@@ -778,7 +804,7 @@ try:
             base = server_url.strip() if provider == "Custom" else cfg.get("base_url", "")
             if refresh:
                 _MODEL_LIST_CACHE_TS.pop((provider, base), None)
-            if cfg.get("native_protocol") == "gemini":
+            if cfg.get("native_protocol") == "gemini" and not cfg.get("vertex"):
                 # The check needs the unfiltered list, so it is fetched raw here.
                 raw = await loop.run_in_executor(None, lambda: _fetch_models_from_server(
                     cfg["base_url"], _resolve_api_key("Gemini"), "gemini"))
@@ -878,6 +904,8 @@ def _model_info(provider: str, model: str, server_url: str = "") -> dict:
     elif proto == "gemini":
         if "gemma" in name:
             badges += [["vision", ""], ["no thinking control", "off"]]
+        elif cfg.get("vertex"):  # no Files API on Vertex: video goes as sampled frames
+            badges += [["vision", ""], ["audio", ""], ["thinking levels", "a"]]
         else:
             badges += [["vision", ""], ["video + audio", ""], ["thinking levels", "a"]]
     elif proto == "agy_cli":
@@ -896,7 +924,7 @@ def _model_info(provider: str, model: str, server_url: str = "") -> dict:
             opts = lm["reasoning"]
             v = v if v in opts else ("on" if v != "off" and "on" in opts else v)
         levels[q] = v
-    hidden = _gemini_hidden_models() if proto == "gemini" else {}
+    hidden = _gemini_hidden_models() if provider == "Gemini" else {}
     return {"provider": provider, "model": model, "status": _provider_status(provider, server_url),
             "providers": {p: _provider_status(p, server_url if p == provider else "")["ok"] for p in PROVIDERS},
             "badges": badges, "lmstudio": lm, "levels": levels,
@@ -1314,6 +1342,7 @@ def _send_gemini_native(
     video_fps: float = 2.0,
     include_thoughts: bool = False,
     audio: list[bytes] | None = None,
+    vertex: bool = False,
 ) -> str:
     """Send a chat request via google-genai SDK.
 
@@ -1331,11 +1360,16 @@ def _send_gemini_native(
         ) from None
 
     if not api_key:
-        raise RuntimeError("Gemini requires an API key — set GEMINI_API_KEY in env or .env")
+        raise RuntimeError("Gemini (Vertex) requires an API key — set VERTEX_API_KEY in env or .env" if vertex
+                           else "Gemini requires an API key — set GEMINI_API_KEY in env or .env")
     if not model or model.startswith("<"):
         raise RuntimeError(f"Invalid model: {model!r}.")
+    if vertex and video is not None:  # _video_route sends frames instead; this is the last guard
+        raise RuntimeError("Gemini (Vertex) has no Files API: send the video as sampled_frames.")
 
-    client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=int(timeout * 1000)))
+    # Vertex: the SDK's express client, key only (project + key together is refused by the SDK).
+    client = genai.Client(api_key=api_key, vertexai=True if vertex else None,
+                          http_options=types.HttpOptions(timeout=int(timeout * 1000)))
 
     # Convert messages: extract system, convert user content (including images)
     system_text = None
@@ -2107,9 +2141,11 @@ def _video_route(provider: str, model_name: str, video, video_input_mode: str) -
         raise RuntimeError(f"Unknown provider: {provider!r}")
     if video_input_mode not in ("auto", "native_video", "sampled_frames"):
         raise ValueError(f"Unknown video input mode: {video_input_mode!r}")
-    native_video = video is not None and video_input_mode != "sampled_frames" and cfg.get("native_protocol") == "gemini"
+    native_video = (video is not None and video_input_mode != "sampled_frames"
+                    and cfg.get("native_protocol") == "gemini" and not cfg.get("vertex"))  # no Files API on Vertex
     if video is not None and video_input_mode == "native_video" and not native_video:
-        raise ValueError("native_video is supported only by the Gemini provider; select sampled_frames for this provider.")
+        raise ValueError("native_video is supported only by the Gemini provider (not Gemini (Vertex)); "
+                         "select sampled_frames for this provider.")
     if native_video and "gemini" not in model_name.lower():
         raise ValueError("Native video requires a Gemini video-capable model; select sampled_frames for Gemma.")
     return cfg, native_video
@@ -2407,7 +2443,9 @@ def write_prompt_api(
     elif cfg.get("native_protocol") == "gemini":
         # Caching: create or reuse a cached content resource for the stable prefix
         cache_name: str | None = None
-        if enable_caching and resolved_key and sys_prompt and stable_user_text:
+        if enable_caching and cfg.get("vertex"):
+            print("[Luna-LLMPromptAPI] Gemini (Vertex): no cached content on this route; sending without it.")
+        elif enable_caching and resolved_key and sys_prompt and stable_user_text:
             cache_name = _gemini_create_cached_content(
                 api_key=resolved_key,
                 model=model_name,
@@ -2433,6 +2471,7 @@ def write_prompt_api(
             video_fps=gemini_video_fps,
             include_thoughts=level is not None,
             audio=audio_clips,
+            vertex=bool(cfg.get("vertex")),
         )
     else:
         raw = _send_chat_completion(

@@ -240,7 +240,7 @@ class WriterApiCoreTest(unittest.TestCase):
                       "frequency_penalty": 0.0, "max_tokens": 4096, "seed": 0},
             output_format="text", stop_sequences=[], thinking_budget=5, thinking_level="high",
             cached_content_name=None, timeout=120.0, video=None, video_fps=2.0,
-            include_thoughts=False, audio=[]))
+            include_thoughts=False, audio=[], vertex=False))
 
     def test_output_formats_json_and_list(self):
         for fmt, tail in (("json", "valid JSON object"), ("list", "numbered list")):
