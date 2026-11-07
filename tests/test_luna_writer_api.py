@@ -45,7 +45,31 @@ class WriterApiTest(unittest.TestCase):
         return out, seen
 
     def test_version(self):
-        self.assertEqual(self.api.API_VERSION, 2)
+        self.assertEqual(self.api.API_VERSION, 3)
+
+    def test_quality_settings_are_the_api_nodes_own(self):
+        self.assertEqual(self.api.quality_levels(), ["fast", "normal", "quality", "ultra"])
+        for provider, model in (("OpenAI", "gpt-6-luna"), ("Gemini (Vertex)", "gemini-3.8-flash"),
+                                ("Grok (xAI)", "grok-4.7"), ("Claude (Max)", "claude-sonnet-5-5"), ("Custom", "x")):
+            for q in ("fast", "normal", "quality", "ultra", "custom"):
+                self.assertEqual(self.api.quality_settings(provider=provider, model_name=model, quality=q),
+                                 self.api_node._request_quality_settings(provider, model, q))
+        # The senders' per-model rules apply: what the node itself would send for that model.
+        qs = lambda p, m, q: self.api.quality_settings(provider=p, model_name=m, quality=q)
+        self.assertEqual(qs("OpenAI", "gpt-4o", "normal"), {}, "no reasoning setting on a chat model")
+        self.assertEqual(qs("OpenAI", "gpt-6-astra", "fast"), {"reasoning_effort": "low"}, "astra has no 'none'")
+        self.assertEqual(qs("OpenAI", "gpt-6-luna", "fast"), {"reasoning_effort": "none"})
+        self.assertEqual(qs("OpenAI", "gpt-5-mini", "fast"), {"reasoning_effort": "low"})
+        self.assertEqual(qs("Grok (xAI)", "grok-4.5", "ultra"), {"reasoning_effort": "high"})
+        self.assertEqual(qs("Grok (xAI)", "grok-4.20-0309-reasoning", "ultra"), {})
+        self.assertEqual(qs("Gemini", "gemini-2.5-flash", "normal"), {}, "2.5 refuses thinking_level")
+        self.assertEqual(qs("Gemini", "gemini-3.1-flash-image", "ultra"), {})
+        self.assertEqual(qs("Gemini", "gemini-flash-latest", "ultra"), {"gemini_thinking_level": "high"})
+        anthropic = [self.api.quality_settings(provider="Anthropic", model_name="claude-opus-5-5", quality=q)
+                     for q in ("fast", "normal", "quality", "ultra")]
+        self.assertEqual([s["reasoning_effort"] for s in anthropic], ["low", "medium", "high", "xhigh"])
+        self.assertEqual(self.api.quality_settings(provider="Gemini (Vertex)", model_name="gemini-3.8-flash",
+                                                   quality="normal"), {"gemini_thinking_level": "medium"})
 
     def test_presets_and_providers_delegate(self):
         with mock.patch.object(self.node, "load_system_prompts", lambda: {"T": "text"}):

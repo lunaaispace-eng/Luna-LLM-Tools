@@ -283,6 +283,10 @@ _QUALITY_EFFORTS = {
     # levels (the sender maps it from the model's own options).
     "LM Studio": ("off", "low", "medium", "high"),
     "Gemini (Antigravity)": ("low", "medium", "high", "high"),
+    # The Anthropic API, for luna_writer_api callers that have one (the Builder
+    # copy's LLM Runner); this node has no provider of that name. Sent as
+    # output_config.effort with adaptive thinking, on models that take it.
+    "Anthropic": ("low", "medium", "high", "xhigh"),
 }
 
 
@@ -316,6 +320,66 @@ def _quality_settings(provider: str, model_name: str, quality: str) -> dict | No
         return {"gemini_thinking_level": levels[idx]}
     efforts = _QUALITY_EFFORTS.get(provider)
     return {"reasoning_effort": efforts[idx]} if efforts else {}
+
+
+# Per-model rules the senders apply before a request goes out, kept here so the
+# senders and luna_writer_api callers (the Builder copy's LLM Runner) send the
+# same thing. Each returns the value to send, or None to send nothing.
+def _gemini_is_gen3(model: str) -> bool:
+    """Gemini 3 and the rolling -latest aliases (Gen-3 now) take thinking_level; 2.5 400s on it."""
+    m = (model or "").lower()
+    return "gemini-3" in m or (m.startswith("gemini-") and m.endswith("-latest"))
+
+
+def _gemini_thinking_level(model: str, level: str) -> str | None:
+    m = (model or "").lower()
+    if not level or "gemma" in m or "image" in m or "banana" in m or not _gemini_is_gen3(m):
+        return None
+    return level
+
+
+def _grok_effort(model: str, effort: str) -> str | None:
+    """reasoning_effort for an xAI model (verified live 2026-10-04): no "none" on xAI, "low" is the floor;
+    only 4.3 / 4.5 / 4.6 / 4.7 / multi-agent take it (the 4.20 reasoning pair 400s); "xhigh" only on 4.6 / 4.7 /
+    multi-agent, "high" elsewhere."""
+    m = (model or "").lower()
+    if not effort:
+        return None
+    if effort == "none":
+        effort = "low"
+    if not any(t in m for t in ("grok-4.3", "grok-4.5", "grok-4.6", "grok-4.7", "multi-agent")):
+        return None
+    if effort == "xhigh" and not any(t in m for t in ("grok-4.6", "grok-4.7", "multi-agent")):
+        effort = "high"
+    return effort
+
+
+def _openai_effort(model: str, effort: str) -> str | None:
+    """reasoning_effort for an OpenAI model: chat models without reasoning (gpt-4o, gpt-4.1) 400 on it; "none"
+    exists only on gpt-5.1 and later 5.x and on gpt-6-sol / gpt-6-luna (gpt-6-astra and gpt-6.1: "Supported values
+    are: 'low', 'medium', 'high', and 'xhigh'", probed 2026-10-04), else "low"."""
+    m = (model or "").lower()
+    if not effort or not m.startswith(("gpt-5", "gpt-6", "o1", "o3", "o4")):
+        return None
+    if effort == "none" and not re.match(r"gpt-(5\.[1-9]|6-(sol|luna))", m):
+        return "low"
+    return effort
+
+
+def _request_quality_settings(provider: str, model_name: str, quality: str) -> dict | None:
+    """`_quality_settings` after the senders' per-model rules: what actually goes out for this model."""
+    settings = _quality_settings(provider, model_name, quality)
+    if not settings:
+        return settings
+    if "gemini_thinking_level" in settings:
+        level = _gemini_thinking_level(model_name, settings["gemini_thinking_level"])
+        return {"gemini_thinking_level": level} if level else {}
+    effort = settings.get("reasoning_effort")
+    if provider == "OpenAI":
+        effort = _openai_effort(model_name, effort)
+    elif provider == "Grok (xAI)":
+        effort = _grok_effort(model_name, effort)
+    return {"reasoning_effort": effort} if effort else {}
 
 
 # Last-run figures for the node face (time, tokens, served model, reasoning).
@@ -1092,13 +1156,12 @@ def _sanitize_payload_for_provider(provider: str, payload: dict) -> dict:
             # "none" exists for OpenAI but NOT for xAI — reasoning cannot be
             # disabled, "low" is the floor (4.7: "This model does not support
             # `reasoning_effort` value `none`."). Clamp instead of 400.
-            if p["reasoning_effort"] == "none":
-                p["reasoning_effort"] = "low"
-            if not any(t in _m for t in ("grok-4.3", "grok-4.5", "grok-4.6", "grok-4.7", "multi-agent")):
+            # The rules live in _grok_effort (shared with luna_writer_api).
+            effort = _grok_effort(_m, p["reasoning_effort"])
+            if effort:
+                p["reasoning_effort"] = effort
+            else:
                 p.pop("reasoning_effort")
-            elif p["reasoning_effort"] == "xhigh" and not any(
-                    t in _m for t in ("grok-4.6", "grok-4.7", "multi-agent")):
-                p["reasoning_effort"] = "high"
 
     elif provider == "OpenAI":
         # Every rule below was established by live probe against gpt-5.6-luna /
@@ -1119,7 +1182,8 @@ def _sanitize_payload_for_provider(provider: str, payload: dict) -> dict:
         # rules below. gpt-6-astra and gpt-6.1-sol have NO "none" effort —
         # "Supported values are: 'low', 'medium', 'high', and 'xhigh'." —
         # so clamp to "low"; sampling is then stripped by the rule below.
-        if p.get("reasoning_effort") == "none" and _m.startswith(("gpt-6-astra", "gpt-6.1")):
+        # The rule lives in _openai_effort (shared with luna_writer_api).
+        if p.get("reasoning_effort") == "none" and _openai_effort(_m, "none") == "low":
             p["reasoning_effort"] = "low"
         # gpt-6-luna returns HTTP 500 (server_error, repeatable, 3/3) whenever
         # presence_penalty or frequency_penalty is sent. gpt-6-sol accepts them.
@@ -1465,8 +1529,7 @@ def _send_gemini_native(
     # flash-lite-latest -> 3.5-flash-lite). pro-latest and flash-lite-latest
     # 400 on thinkingBudget=0 ("Budget 0 is invalid. This model only works in
     # thinking mode.") and all three accept thinking_level, so route them as Gen-3.
-    _is_gen3 = "gemini-3" in model.lower() or (
-        model.lower().startswith("gemini-") and model.lower().endswith("-latest"))
+    _is_gen3 = _gemini_is_gen3(model)
     if _is_gemma:
         pass
     elif _is_gen3:

@@ -87,7 +87,7 @@ class RegistrationTests(unittest.TestCase):
     def test_writer_api_registered_for_lunastudio(self):
         writer = sys.modules.get("luna_writer_api")
         self.assertIsNotNone(writer)
-        self.assertEqual(writer.API_VERSION, 2)
+        self.assertEqual(writer.API_VERSION, 3)
         for name in ("presets", "api_providers", "provider_env_vars", "gguf_models", "downscale_to_mp", "write_api"):
             self.assertTrue(callable(getattr(writer, name)), name)
 

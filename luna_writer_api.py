@@ -9,7 +9,7 @@ Thin wrappers over the nodes' own functions — no behaviour of their own. The G
 """
 from __future__ import annotations
 
-API_VERSION = 2
+API_VERSION = 3  # 3: quality_settings(), quality_levels()
 
 
 class WriterBusy(RuntimeError):
@@ -142,6 +142,20 @@ def chat(*, provider: str, model_name: str, user_prompt: str, system_prompt: str
     messages.append({"role": "user",
                      "content": api._build_multimodal_user_content(text, images) if images else text})
     return getattr(api, sender)(model_name, messages, float(timeout_seconds), reasoning_effort)
+
+
+def quality_levels() -> list[str]:
+    """The four quality levels, fastest first: fast, normal, quality, ultra (the API node's own names)."""
+    return [q for q in _api().QUALITY_OPTIONS if q != "custom"]
+
+
+def quality_settings(*, provider: str, model_name: str, quality: str) -> dict | None:
+    """What a quality level sends for this provider and model: the API node's own table after its senders'
+    per-model rules (a model that refuses the setting gets ``{}``). ``{"reasoning_effort": ...}``,
+    ``{"gemini_thinking_level": ...}``, ``{}`` when nothing is sent, None for "custom". ``provider`` is an API node
+    provider name, or "Anthropic" for the Anthropic API.
+    Version 3, for the Builder copy's LLM Runner (Luna-Director-Suite plans/2026-11-07-runner-thinking.md)."""
+    return _api()._request_quality_settings(provider, model_name, quality)
 
 
 def register() -> None:
