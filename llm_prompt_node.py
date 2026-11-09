@@ -48,7 +48,9 @@ import folder_paths
 from comfy_api.latest import io
 
 # Bundled output cleaner â€” no external dependencies
-from .output_cleaner import OutputCleanConfig, clean_model_output, normalize_prompt_separator, split_positive_negative
+from .output_cleaner import (
+    OutputCleanConfig, clean_model_output, normalize_prompt_separator, split_positive_negative, strip_code_fence_lines,
+)
 from .h3_validate import validate_h3, format_log
 
 logger = logging.getLogger(__name__)
@@ -2259,6 +2261,9 @@ class _LLMRunner:
                 frequency_penalty=frequency_penalty,
                 reasoning_budget=reasoning_budget,
             )
+            # The H3 presets show their format in ```text blocks; the model copies the fence, and a fence that reaches
+            # the video model is drawn as letters (2026-11-09). Only the fence lines go; the text between them stays.
+            result = strip_code_fence_lines(result)
 
             # Positive/negative parsing is now fully handled by the hardened
             # split_positive_negative() below (markers -> labels -> pipe -> JSON),

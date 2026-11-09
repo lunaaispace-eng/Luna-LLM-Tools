@@ -237,6 +237,18 @@ def _try_json_pos_neg(text: str):
     return None
 
 
+def strip_code_fence_lines(text: str) -> str:
+    """Drop markdown fence lines (```, ```text, ```json) and keep everything between them.
+
+    The H3 presets show their output format inside ```text blocks, and the model copies the fence into its answer;
+    a fence that reaches the video model is read as words ("text"), and H3 then draws letters into the picture
+    (2026-11-09, H3 Luna Sampler_Chain clip 1).
+    """
+    if not text or "```" not in text:
+        return text
+    return "\n".join(line for line in text.splitlines() if not _CODE_FENCE_RE.match(line)).strip()
+
+
 def split_positive_negative(text: str, do_split: bool) -> tuple[str, str]:
     """Split model output into (positive, negative) — robust to a dropped delimiter.
 
