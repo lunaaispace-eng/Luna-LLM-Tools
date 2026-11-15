@@ -27,7 +27,7 @@ Also live, same day:
     video task is set.") and rejects aspect_ratio ("Aspect ratio cannot be set
     in response format for extend task."), so extend = uploaded clip only.
   - Edit or extend of an UPLOADED clip came back `content_blocked` ("The prompt
-    contains sensitive words...") for harmless prompts on Peti's key. Google
+    contains sensitive words...") for harmless prompts on the tested key. Google
     documents uploaded-video editing as unavailable in the EEA, Switzerland and
     the UK; this is most likely that restriction surfacing under a misleading
     message. Not proven — the upload path is kept for keys outside the region.

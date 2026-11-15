@@ -254,19 +254,19 @@ export function openPanel(node, api) {
 
     document.body.appendChild(el);
     refreshAll();
-    // Attached to the node (Peter, 2026-10-10: "it is independent, it is not
-    // connected to the node and zoom in and out keeps it the same"): placed in
+    // Attached to the node (2026-10-10: it was independent of the node and
+    // kept its size when the canvas zoomed): placed in
     // canvas units next to the node and redrawn every frame at the canvas zoom,
     // so it pans and zooms with the node. LiteGraph emits nothing on a
     // pan / zoom, hence the frame loop (Pixaroma node_panel.mjs followNode).
-    // Not draggable (Peter: "i can move it anyware on the canvas" read as a
+    // Not draggable (a panel that moves anywhere on the canvas reads as a
     // separate window): it always sits against the node's right edge.
     const anchor = { dx: node.size[0] + 10, dy: 0 };
     const stopFollow = follow(el, node, anchor);
     const stopDrag = () => {};
 
-    // No close on an outside click (Peter, 2026-10-10: "if i click anywhere on
-    // the canvas it is closing"): the panel is part of the node now and stays
+    // No close on an outside click (2026-10-10: a click anywhere on
+    // the canvas closed it): the panel is part of the node now and stays
     // open while the canvas is panned or other nodes are used. It closes with
     // the gear, ✕, Done, Escape, or when the node goes away.
     const onEsc = (e) => {

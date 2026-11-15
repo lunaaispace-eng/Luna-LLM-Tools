@@ -143,7 +143,7 @@ PROVIDERS = {
         "live_models": True,
         # Whitelist applied to the LIVE list too, not just the fallback. The
         # /v1/models query returns ~124 models — a decade of legacy 3.5/4/4o/o1
-        # plus every dated snapshot — and Peti uses only the 5.6 family
+        # plus every dated snapshot — and only the 5.6 family is used
         # (2026-08-31). Widen this regex to admit a new family; there is no
         # widget for it on purpose, because a dropdown of 124 models is worse
         # than editing one line when 5.7 ships.
@@ -161,9 +161,9 @@ PROVIDERS = {
             "gpt-5.6-luna",   # cheapest / fastest
         ],
     },
-    # Local models through LM Studio's own REST API (Peter, 2026-10-12: "Lm studio
-    # is used for Local Models in Luna Bridge Claude so the server is ok, we can
-    # use a function LM Studio has to unload the model"). Native /api/v1, not
+    # Local models through LM Studio's own REST API (2026-10-12: LM Studio already
+    # serves the local models in Luna Bridge, so its server is fine to use, and
+    # it has a function to unload a model). Native /api/v1, not
     # the OpenAI-compatible /v1: it reports load state, reasoning options and
     # whether a request loaded the model, which the unload rule needs.
     "LM Studio": {
@@ -176,8 +176,8 @@ PROVIDERS = {
         "native_protocol": "lmstudio",
         "fallback_models": ["<start LM Studio's server and refresh>"],
     },
-    # ---- Subscription routes (Peter, 2026-10-04: "not on API but on my Max
-    # sub", "do the same for codex", "and Grok sub cli"). Each runs the
+    # ---- Subscription routes (2026-10-04: use the Max subscription instead of
+    # the API, then the same for Codex and the Grok subscription CLI). Each runs the
     # vendor's own CLI headless on its stored login - the sanctioned way to use
     # a subscription from a program; the node never reads or stores a token.
     # They spend that subscription's quota (shared with interactive sessions)
@@ -202,7 +202,7 @@ PROVIDERS = {
     "Codex (ChatGPT)": {
         # `codex exec`; prompt on stdin, images as temp PNGs via -i, read-only
         # sandbox. gpt-6-astra left out on purpose: it empties the ChatGPT
-        # quota in a few turns (agent-fleet rule, Peter 2026-09-19).
+        # quota in a few turns (agent-fleet rule, 2026-09-19).
         "base_url": "",
         "env_var": None,
         "needs_auth": False,
@@ -235,8 +235,8 @@ PROVIDERS = {
         ],
     },
     "Gemini (Antigravity)": {
-        # `agy` (Antigravity CLI) on Peter's Gemini login (Peter, 2026-10-12:
-        # "yes"). The npm `gemini` CLI has no login on this machine. agy has
+        # `agy` (Antigravity CLI) on the Gemini login (2026-10-12).
+        # The npm `gemini` CLI has no login on this machine. agy has
         # no stdin prompt, so the request goes in prompt.md in a throwaway
         # folder with the images and audio, and agy runs in read-only plan
         # mode. Its models carry the reasoning level in the name
@@ -611,8 +611,8 @@ def _apply_model_pattern(provider: str, models: list[str]) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Gemini model check (Peter, 2026-10-12: "check the curent models and have the
-# node refresh them"). ListModels keeps advertising retired models: on
+# Gemini model check (2026-10-12: check the current models and have the
+# node refresh them). ListModels keeps advertising retired models: on
 # 2026-10-12 the three gemini-2.5 models 404'd and gemini-3.7-flash /
 # 3.5-flash / 3.1-flash-lite-preview were silently served by newer models.
 # One tiny call per model tells them apart; the result is cached in a
@@ -825,8 +825,8 @@ def _fetch_schema_live_models() -> list[str]:
 def _schema_live_models() -> list[str]:
     """The live lists fetched once at the first build, plus every list the dropdown route has shown.
 
-    No timed refresh (Peter, 2026-10-19: "providers dont release new models so
-    often"). A new model reaches validation through the dropdown, which loads
+    No timed refresh (2026-10-19: providers do not release new models
+    often). A new model reaches validation through the dropdown, which loads
     its list on node add, workflow open, provider change and the refresh button.
     """
     global _SCHEMA_MODELS
@@ -2031,7 +2031,7 @@ def _send_grok_cli(model: str, messages: list[dict], timeout: float, reasoning_e
 
 def _send_agy_cli(model: str, messages: list[dict], timeout: float, reasoning_effort: str,
                   audio: list[tuple[bytes, str]] | None = None) -> str:
-    """Antigravity CLI (`agy`) headless on Peter's Gemini login. TESTED 2026-10-12: it reads
+    """Antigravity CLI (`agy`) headless on the Gemini login. TESTED 2026-10-12: it reads
     prompt.md, looks at the images and listens to the audio in its folder, in plan mode."""
     import base64 as _b64
     exe = _cli_exe("agy", [r"D:\CLI-Data\agy\agy.exe"])
@@ -2087,9 +2087,9 @@ def _send_lmstudio(base_url: str, api_key: str | None, model: str, messages: lis
                    unload_after_run: bool) -> str:
     """LM Studio's native chat (POST /api/v1/chat), with the unload rule.
 
-    Unload rule (Peter, 2026-10-12, "yes"): unload only a model this request
+    Unload rule (2026-10-12): unload only a model this request
     loaded — the reply carries model_load_time_seconds only then. A model that
-    was already loaded (by Peter or Luna Bridge) is used as it is: no
+    was already loaded (by the user or Luna Bridge) is used as it is: no
     context_length is sent for it, because a different one makes LM Studio
     load a second copy and evict the first (TESTED 2026-10-12).
     """
@@ -2161,7 +2161,7 @@ def _send_lmstudio(base_url: str, api_key: str | None, model: str, messages: lis
 # The writer core (shared by the node and luna_writer_api)
 # ---------------------------------------------------------------------------
 
-# Routes that take audio (Peter, 2026-10-12: "and dont forget the audio input").
+# Routes that take audio (2026-10-12: the audio input is required).
 # TESTED with a spoken clip 2026-10-12: Gemini API and agy yes; Grok API, OpenAI
 # gpt-5.6 / gpt-6 chat and Codex CLI no; LM Studio's chat takes text + image only.
 AUDIO_PROTOCOLS = ("gemini", "agy_cli")

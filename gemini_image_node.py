@@ -72,7 +72,7 @@ IMAGE_SIZES = ["auto", "0.5K", "1K", "2K", "4K"]
 # sending it on an API key fails at run time with:
 #   "person_generation parameter is only supported in Gemini Enterprise Agent
 #    Platform mode, not in Gemini Developer API mode."
-# Confirmed by Peti in live use 2026-08-30. This node is Developer-API only, so
+# Confirmed in live use 2026-08-30. This node is Developer-API only, so
 # the control can never work here; a widget that always errors is worse than no
 # widget. Only add it back behind a real Vertex/ADC auth path.
 

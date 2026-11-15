@@ -1190,7 +1190,7 @@ _DRAFTER_CACHE: dict[str, str | None] = {}
 # MEASURED 2026-10-11 (Gemma4 26B-A4B Q4_K_P, Krea preset, wheel 0.4.2): with the
 # drafter, swa_full must be on (off: 157 -> 86 tok/s); on costs VRAM that grows
 # with the context: 4k +0.6 GB (188 tok/s), 8k +1.4 GB (184), 16k +2.9 GB (180),
-# vs 157 tok/s without. Peter: drafter on at 8k or less.
+# vs 157 tok/s without. Rule: drafter on at 8k or less.
 _DRAFTER_MAX_CTX = 8192
 
 
