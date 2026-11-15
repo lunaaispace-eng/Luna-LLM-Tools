@@ -80,8 +80,14 @@ class SchemaAndStatsTests(unittest.TestCase):
         self.assertEqual(q.default, "fast")
         self.assertTrue(q.optional)  # API-format prompts saved before it still validate
         self.assertEqual(q.options, ["fast", "normal", "quality", "ultra", "custom"])
-        # Everything after it is a socket, so no saved widget value shifts.
-        for i in inputs[ids.index("quality") + 1:]:
+        # After it only the MoE widgets (2026-11-15, optional, appended last), then
+        # sockets, so no saved widget value shifts.
+        moe = ["moe_cpu_layers", "moe_cache_mib", "moe_cache_cpu_share"]
+        at = ids.index("quality") + 1
+        self.assertEqual(ids[at:at + len(moe)], moe)
+        for i in inputs[at:at + len(moe)]:
+            self.assertTrue(i.optional, i.id)
+        for i in inputs[at + len(moe):]:
             self.assertTrue(getattr(i, "force_input", False) or type(i).__name__ != "Input"
                             or i.id in ("image", "reference_image", "video", "audio"), i.id)
 

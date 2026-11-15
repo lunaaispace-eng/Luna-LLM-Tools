@@ -211,5 +211,59 @@ class MtpGateTests(unittest.TestCase):
         self.assertNotIn("speculative", kw)
 
 
+class MoeSettingsTests(unittest.TestCase):
+    """`_load_model` passes the MoE settings only when set (2026-11-15)."""
+
+    setUp = MtpGateTests.setUp
+    tearDown = MtpGateTests.tearDown
+    _load = MtpGateTests._load
+
+    MOE_KEYS = ("cpu_moe", "n_cpu_moe", "moe_cache_size", "moe_cache_cpu_share")
+
+    def test_defaults_pass_nothing(self):
+        kw, runner = self._load(self.plain, mtp=0)
+        for k in self.MOE_KEYS:
+            self.assertNotIn(k, kw)
+        self.assertEqual(runner.current_signature["moe"], {})
+
+    def test_all_in_ram_with_cache(self):
+        kw, runner = self._load(self.plain, mtp=0, moe_cpu_layers=-1, moe_cache_mib=6144,
+                                moe_cache_cpu_share=0.95)
+        self.assertTrue(kw["cpu_moe"])
+        self.assertNotIn("n_cpu_moe", kw)
+        self.assertEqual(kw["moe_cache_size"], 6144 * 1024 * 1024)
+        self.assertAlmostEqual(kw["moe_cache_cpu_share"], 0.95)
+        self.assertEqual(runner.current_signature["moe"]["moe_cache_size"], 6144 * 1024 * 1024)
+
+    def test_first_n_layers(self):
+        kw, _ = self._load(self.plain, mtp=0, moe_cpu_layers=12)
+        self.assertEqual(kw["n_cpu_moe"], 12)
+        self.assertNotIn("cpu_moe", kw)
+        self.assertNotIn("moe_cache_size", kw)
+
+    def test_cache_without_experts_in_ram_is_skipped(self):
+        kw, _ = self._load(self.plain, mtp=0, moe_cache_mib=4096, moe_cache_cpu_share=0.5)
+        for k in self.MOE_KEYS:
+            self.assertNotIn(k, kw)
+
+    def test_cpu_device_passes_nothing(self):
+        with mock.patch.object(self.node, "_pick_device", return_value="cpu"):
+            kw, _ = self._load(self.plain, mtp=0, moe_cpu_layers=-1, moe_cache_mib=4096)
+        for k in self.MOE_KEYS:
+            self.assertNotIn(k, kw)
+
+    def test_change_reloads(self):
+        _, runner = self._load(self.plain, mtp=0)
+        n = len(self.calls)
+        from pathlib import Path
+        with mock.patch.object(self.node, "_resolve_model_paths", return_value=(Path(self.plain), None)), \
+             mock.patch.object(self.node.torch.cuda, "is_available", return_value=False):
+            runner._load_model("m", "auto", n_ctx=4096, want_vision=False, mtp_draft_tokens=0)
+            self.assertEqual(len(self.calls), n)          # same settings: no reload
+            runner._load_model("m", "auto", n_ctx=4096, want_vision=False, mtp_draft_tokens=0,
+                               moe_cpu_layers=-1)
+            self.assertEqual(len(self.calls), n + 1)      # experts to RAM: reload
+
+
 if __name__ == "__main__":
     unittest.main()

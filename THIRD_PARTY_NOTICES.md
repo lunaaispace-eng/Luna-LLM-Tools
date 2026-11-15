@@ -10,6 +10,7 @@ This file lists what those packs credit or adapt from other projects.
 | ComfyUI-Pixaroma (c) 2026 pixaroma | MIT | `web/llm_prompt_face.js`, `web/llm_prompt_api_face.js`, `web/llm_prompt_panel.mjs` | Techniques for the node face and settings panel (DOM face in both renderers, floating panel, undo guard). |
 | ComfyUI-llama-cpp_vlm (lihaoyun6) | not checked | `llm_prompt_node.py` (reasoning-budget approach, one comment) | Approach borrowed; no code copied is recorded. |
 | llama-cpp-python, JamePeng build | MIT | runtime dependency of Luna-LLMPrompt, not shipped | Gemma and Qwen vision handlers. `tools/llama_cpp_windows_doctor.py` downloads its wheels. |
+| llama.cpp (ggml-org), v1.0.0 | MIT, Copyright (c) 2023-2026 The ggml authors | `tools/moe_cache_tune.py` | A copy of `scripts/moe-cache-tune.py` with a Windows change marked in it. Licence text: `licenses/MIT-llama.cpp.txt`. |
 | ComfyUI core | GPL-3.0 | runtime host, not shipped | The pack imports ComfyUI; a bundle with ComfyUI is subject to its GPL-3.0. |
 
 ## Licence of the shared frontend kit

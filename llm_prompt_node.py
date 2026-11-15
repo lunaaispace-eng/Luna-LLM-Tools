@@ -1386,7 +1386,8 @@ class _LLMRunner:
                     disable_thinking: bool = True, want_vision: bool = True,
                     preserve_thinking: bool = False, image_min_tokens: int = 1024,
                     image_max_tokens: int = 4096, load_mmproj: str = "auto",
-                    mtp_draft_tokens: int = 0):
+                    mtp_draft_tokens: int = 0, moe_cpu_layers: int = 0,
+                    moe_cache_mib: int = 0, moe_cache_cpu_share: float = 0.0):
         # Resolve paths directly from the scanned folder list â€” no JSON catalog needed
         model_path, mmproj_path = _resolve_model_paths(model_name)
 
@@ -1469,6 +1470,34 @@ class _LLMRunner:
                 mtp_draft = 2
                 mtp_note = f"MTP on: drafter {drafter.name}, 2 draft tokens."
 
+        # MoE experts in RAM + the llama.cpp 1.0 MoE cache (JamePeng 0.4.7+).
+        # moe_cpu_layers: 0 = experts on the GPU (as before), -1 = all experts
+        # in RAM (cpu_moe), N = the experts of the first N layers in RAM. The
+        # cache keeps the most used experts on the GPU; it only acts when
+        # experts are in RAM, and the CPU share only once the cache is full
+        # (llama.cpp docs/moe-cache.md, v1.0.0). Defaults pass nothing, so a
+        # load with the defaults is the same as before these settings.
+        moe_kwargs = {}
+        moe_note = ""
+        if device_kind != "cpu":
+            if moe_cpu_layers < 0:
+                moe_kwargs["cpu_moe"] = True
+            elif moe_cpu_layers > 0:
+                moe_kwargs["n_cpu_moe"] = int(moe_cpu_layers)
+            if moe_cache_mib > 0:
+                if moe_kwargs:
+                    moe_kwargs["moe_cache_size"] = int(moe_cache_mib) * 1024 * 1024
+                    if moe_cache_cpu_share > 0:
+                        moe_kwargs["moe_cache_cpu_share"] = float(moe_cache_cpu_share)
+                else:
+                    moe_note = ("MoE cache skipped: it only works with experts in RAM "
+                                "(set moe_cpu_layers to -1 or N).")
+            if moe_kwargs:
+                where = "all layers" if moe_kwargs.get("cpu_moe") else f"first {moe_cpu_layers} layers"
+                moe_note = (f"MoE experts in RAM ({where}), cache "
+                            f"{int(moe_cache_mib) if 'moe_cache_size' in moe_kwargs else 0} MiB, "
+                            f"CPU share {float(moe_kwargs.get('moe_cache_cpu_share', 0.0)):g}.")
+
         signature = {
             "model_path": str(model_path),
             "mmproj_path": str(mmproj_path) if has_mmproj else "",
@@ -1487,6 +1516,7 @@ class _LLMRunner:
             "image_max_tokens": int(image_max_tokens),
             "mtp_draft": mtp_draft,
             "mtp_drafter": str(drafter) if drafter else "",
+            "moe": dict(moe_kwargs),
         }
         if self.llm is not None and self.current_signature == signature:
             return
@@ -1498,6 +1528,8 @@ class _LLMRunner:
 
         if mtp_note:
             print(f"[Luna-LLMPrompt] {mtp_note}")
+        if moe_note:
+            print(f"[Luna-LLMPrompt] {moe_note}")
 
         # Load vision handler â€” handler selection order matches JamePeng 0.3.39 API
         # Load the vision handler via the family adapter. The adapter supplies an
@@ -1580,6 +1612,7 @@ class _LLMRunner:
                 draft_n_max=mtp_draft,
                 draft_p_min=0.0,
             )
+        llm_kwargs.update(moe_kwargs)
         if has_mmproj and self.chat_handler is not None:
             # image_min/max_tokens belong on the chat handler, not here.
             llm_kwargs["chat_handler"] = self.chat_handler
@@ -1662,6 +1695,10 @@ class _LLMRunner:
 
         if has_mmproj and self.chat_handler and "chat_handler" not in llm_kwargs_filtered:
             print("[Luna-LLMPrompt] Warning: Llama() doesn't accept chat_handler. Images will be ignored.")
+        dropped_moe = [k for k in moe_kwargs if k not in llm_kwargs_filtered]
+        if dropped_moe:
+            print(f"[Luna-LLMPrompt] Warning: this llama-cpp-python has no {', '.join(dropped_moe)} "
+                  "(the MoE cache needs JamePeng 0.4.7+); loading without it.")
 
         try:
             self.llm = Llama(**llm_kwargs_filtered)
@@ -2043,6 +2080,9 @@ class _LLMRunner:
         video=None,
         audio=None,
         frames: int = 0,
+        moe_cpu_layers: int = 0,
+        moe_cache_mib: int = 0,
+        moe_cache_cpu_share: float = 0.0,
         media_override: list[dict] | None = None,
     ):
         # Gate the chatty status prints for this run (warnings/errors still show).
@@ -2237,6 +2277,8 @@ class _LLMRunner:
                 preserve_thinking=preserve_thinking,
                 image_min_tokens=image_min_tokens, image_max_tokens=image_max_tokens,
                 load_mmproj=load_mmproj, mtp_draft_tokens=mtp_draft_tokens,
+                moe_cpu_layers=moe_cpu_layers, moe_cache_mib=moe_cache_mib,
+                moe_cache_cpu_share=moe_cache_cpu_share,
             )
 
             if media_content and self.chat_handler is None:
@@ -2460,6 +2502,21 @@ class LLMPromptNode(io.ComfyNode):
                                        "tokens (~25 s). quality = up to 2048. ultra = unlimited thinking (~50 s). "
                                        "All use MTP when the model has it. custom = use the thinking, "
                                        "reasoning_budget and mtp_draft_tokens settings as set."),
+                # MoE settings (2026-11-15), after quality for the same reason.
+                io.Int.Input("moe_cpu_layers", default=0, min=-1, max=200, step=1, optional=True, advanced=True,
+                             tooltip="MoE models only (e.g. Qwen3.6-35B-A3B, Gemma4-26B-A4B): keep the experts "
+                                     "in RAM to free VRAM. 0 = all on the GPU (fastest when it fits), "
+                                     "-1 = all experts in RAM, N = the first N layers' experts in RAM. "
+                                     "Use when a video model shares the GPU. Dense models ignore it."),
+                io.Int.Input("moe_cache_mib", default=0, min=0, max=65536, step=256, optional=True, advanced=True,
+                             tooltip="MoE cache: keeps the most used experts on the GPU, in MiB. Only with "
+                                     "moe_cpu_layers on (-1 or N). 0 = off. Without a cache every expert runs "
+                                     "from RAM; a small cache can be slower than none."),
+                io.Float.Input("moe_cache_cpu_share", default=0.0, min=0.0, max=1.0, step=0.05, optional=True,
+                               advanced=True,
+                               tooltip="Share of MoE cache misses the CPU computes instead of uploading them to "
+                                       "the GPU, once the cache is full. 0 = upload all. Ref: 0.95 helped on some "
+                                       "PCs, hurt on others; the llama.cpp tuning script picks it per PC."),
 
                 # ===== Optional connections (input sockets) =====
                 io.String.Input("style", optional=True, force_input=True,

@@ -34,6 +34,11 @@ const SECTIONS = [
         ["n_gpu_layers", "GPU layers (-1 = all)", "number"],
         ["device", "Device", "combo"],
     ] },
+    { title: "MoE models", icon: "▦", folded: true, rows: [
+        ["moe_cpu_layers", "Experts in RAM (0 off, -1 all)", "number"],
+        ["moe_cache_mib", "Expert cache MiB (0 off)", "number"],
+        ["moe_cache_cpu_share", "Cache CPU share", "slider"],
+    ] },
     { title: "Output", icon: "≡", rows: [
         ["output_format", "Format", "combo-chips"],
         ["split_output", "Split positive / negative", "toggle"],
