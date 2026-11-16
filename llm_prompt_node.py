@@ -50,6 +50,7 @@ from comfy_api.latest import io
 # Bundled output cleaner â€” no external dependencies
 from .output_cleaner import (
     OutputCleanConfig, clean_model_output, normalize_prompt_separator, split_positive_negative, strip_code_fence_lines,
+    negative_dropped, NEGATIVE_DROPPED_NOTE,
 )
 from .h3_validate import validate_h3, format_log
 
@@ -2323,10 +2324,14 @@ class _LLMRunner:
             positive, negative = split_positive_negative(result, split_output)
 
             log = ""
+            if negative_dropped(result, split_output):
+                log = NEGATIVE_DROPPED_NOTE
+                print(f"[Luna-LLMPrompt] {log}")
             if validate == "h3":
                 positive, findings = validate_h3(positive, frames or None)
-                log = format_log(positive, frames or None, findings)
-                print(f"[Luna-LLMPrompt] {log}")
+                report = format_log(positive, frames or None, findings)
+                print(f"[Luna-LLMPrompt] {report}")
+                log = f"{log}\n{report}" if log else report
 
             # With thinking on, the reasoning is stripped from the prompt but is
             # the most useful thing to inspect - surface it here rather than

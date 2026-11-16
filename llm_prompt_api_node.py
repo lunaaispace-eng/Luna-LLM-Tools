@@ -40,7 +40,8 @@ from .llm_prompt_node import (
     _sample_video_frames,
     _resolve_model_settings,
 )
-from .output_cleaner import OutputCleanConfig, clean_model_output, normalize_prompt_separator, split_positive_negative
+from .output_cleaner import (OutputCleanConfig, clean_model_output, normalize_prompt_separator, split_positive_negative,
+                             negative_dropped, NEGATIVE_DROPPED_NOTE)
 from .h3_validate import validate_h3, format_log
 from .gemini_video import gemini_video_part
 from comfy_api.latest import io
@@ -2576,10 +2577,14 @@ def write_prompt_api(
     positive, negative = split_positive_negative(cleaned, split_output)
 
     log = ""
+    if negative_dropped(cleaned, split_output):
+        log = NEGATIVE_DROPPED_NOTE
+        print(f"[Luna-LLMPromptAPI] {log}")
     if validate == "h3":
         positive, findings = validate_h3(positive, frames or None)
-        log = format_log(positive, frames or None, findings)
-        print(f"[Luna-LLMPromptAPI] {log}")
+        report = format_log(positive, frames or None, findings)
+        print(f"[Luna-LLMPromptAPI] {report}")
+        log = f"{log}\n{report}" if log else report
     if media_log:
         print(f"[Luna-LLMPromptAPI] {media_log}")
         log = "\n".join(part for part in (media_log, log) if part)

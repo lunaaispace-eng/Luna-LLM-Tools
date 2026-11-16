@@ -249,6 +249,30 @@ def strip_code_fence_lines(text: str) -> str:
     return "\n".join(line for line in text.splitlines() if not _CODE_FENCE_RE.match(line)).strip()
 
 
+NEGATIVE_DROPPED_NOTE = ("split_output is off: the preset also wrote a negative prompt, which was dropped. "
+                         "Turn split_output on to get it on the negative output.")
+
+
+def _negative_cut(text: str):
+    """The positive before a negative marker, or None when there is no marker after real content."""
+    m = _NEG_MARKER_RE.search(text)
+    if not m:
+        return None
+    positive = _strip_pos_marker(text[:m.start()])
+    return positive or None
+
+
+def negative_dropped(text: str, do_split: bool) -> bool:
+    """True when split_positive_negative(text, do_split) cut a written negative off."""
+    text = (text or "").strip()
+    if do_split or not text:
+        return False
+    parsed = _try_json_pos_neg(text)
+    if parsed and not parsed[1]:
+        return False
+    return _negative_cut(text) is not None
+
+
 def split_positive_negative(text: str, do_split: bool) -> tuple[str, str]:
     """Split model output into (positive, negative) — robust to a dropped delimiter.
 
@@ -267,6 +291,12 @@ def split_positive_negative(text: str, do_split: bool) -> tuple[str, str]:
         parsed = _try_json_pos_neg(text)
         if parsed and not parsed[1]:
             return parsed[0], ""
+        # A negative preset still writes [NEGATIVE] with split off; there is no
+        # output for it, so cut it off rather than leak it into the positive
+        # (negative_dropped() lets the caller say so in its log).
+        cut = _negative_cut(text)
+        if cut is not None:
+            return cut, ""
         return _strip_pos_marker(text), ""
 
     # 1) JSON object

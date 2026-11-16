@@ -111,6 +111,18 @@ class JsonPromptSplitTests(unittest.TestCase):
         raw = '{"positive": "a", "negative": "b"}'
         self.assertEqual(self.oc.split_positive_negative(raw, False), (raw, ""))
 
+    def test_split_off_drops_marked_negative(self):
+        # A _Negative preset with split off: the negative must not leak into the positive.
+        raw = "[POSITIVE]\nA keeper on a cliff.\n[NEGATIVE]\nAn amateur, flatly lit image."
+        self.assertEqual(self.oc.split_positive_negative(raw, False), ("A keeper on a cliff.", ""))
+        self.assertTrue(self.oc.negative_dropped(raw, False))
+        self.assertFalse(self.oc.negative_dropped(raw, True))
+
+    def test_split_off_keeps_text_without_marker(self):
+        raw = "A keeper on a cliff, negative space above."
+        self.assertEqual(self.oc.split_positive_negative(raw, False), (raw, ""))
+        self.assertFalse(self.oc.negative_dropped(raw, False))
+
 
 class Gemma4ThinkingHandlerTests(unittest.TestCase):
     """The text-only Gemma 4 handler renders the GGUF template with enable_thinking=true."""
