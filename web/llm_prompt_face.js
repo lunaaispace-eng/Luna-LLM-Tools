@@ -24,7 +24,7 @@
 
 import { app } from "/scripts/app.js";
 // Versioned: browsers kept an old copy of this module after Ctrl+F5 (2026-10-10). Bump on every change.
-import { closePanel, isPanelOpenFor, openPanel, recentlyClosed, refreshPanel } from "./llm_prompt_panel.mjs?v=7";
+import { closePanel, isPanelOpenFor, openPanel, recentlyClosed, refreshPanel } from "./llm_prompt_panel.mjs?v=8";
 
 const NODE = "Luna-LLMPrompt";
 const FACE = "llm_face";
@@ -300,7 +300,7 @@ function renderModel(node, root) {
     if (info?.found) {
         if (info.quant) m1 += b(info.quant);
         // Gemma 4: no own heads, but a matching drafter in the LLM folders gives
-        // MTP at a context of 8k or less (the node's default).
+        // MTP at a context of 16k or less (the node's default).
         m1 += info.mtp ? b("MTP", "g") : info.mtp_drafter ? b("MTP drafter", "g") : b("no MTP", "off");
         if (info.vision) m1 += b("vision");
         m1 += `<span style="margin-left:4px">${info.size_gb} GB</span>`;

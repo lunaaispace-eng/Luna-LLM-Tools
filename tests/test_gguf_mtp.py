@@ -184,8 +184,13 @@ class MtpGateTests(unittest.TestCase):
         self.assertTrue(kw["swa_full"])
         self.assertEqual(runner.current_signature["mtp_draft"], 2)
 
-    def test_gemma_drafter_off_above_8k(self):
+    def test_gemma_drafter_on_at_16k(self):
         kw, _ = self._load(self.gemma, mtp=3, n_ctx=16384)
+        self.assertIn("speculative", kw)
+        self.assertTrue(kw["swa_full"])
+
+    def test_gemma_drafter_off_above_16k(self):
+        kw, _ = self._load(self.gemma, mtp=3, n_ctx=32768)
         self.assertNotIn("speculative", kw)
         self.assertFalse(kw["swa_full"])
 

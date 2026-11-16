@@ -1190,8 +1190,9 @@ _DRAFTER_CACHE: dict[str, str | None] = {}
 # MEASURED 2026-10-11 (Gemma4 26B-A4B Q4_K_P, Krea preset, wheel 0.4.2): with the
 # drafter, swa_full must be on (off: 157 -> 86 tok/s); on costs VRAM that grows
 # with the context: 4k +0.6 GB (188 tok/s), 8k +1.4 GB (184), 16k +2.9 GB (180),
-# vs 157 tok/s without. Rule: drafter on at 8k or less.
-_DRAFTER_MAX_CTX = 8192
+# vs 157 tok/s without. Rule: drafter on at 16k or less, the n_ctx default
+# (the 16k VRAM cost accepted 2026-11-16).
+_DRAFTER_MAX_CTX = 16384
 
 
 def _find_mtp_drafter(model_path, arch: str) -> Path | None:
@@ -2401,9 +2402,9 @@ class LLMPromptNode(io.ComfyNode):
                 io.Combo.Input("output_format", options=["text", "json", "list"], default="text",
                                tooltip="text = one finished prompt (normal). json = structured data. "
                                        "list = numbered scenes for multi-shot video."),
-                io.Boolean.Input("split_output", default=True,
+                io.Boolean.Input("split_output", default=False,
                                  tooltip="ON splits a 'positive | negative' result into the two outputs. "
-                                         "Leave ON for SDXL; harmless for Flux/Chroma (no negative)."),
+                                         "Turn ON for SDXL; OFF (default) for Flux/Chroma/H3 (no negative)."),
                 io.Boolean.Input("auto_settings", default=True,
                                  tooltip="Recommended ON. Auto-applies the best sampling for your model family "
                                          "(Qwen / Gemma) and skips reasoning. OFF = control sampling yourself "
@@ -2414,20 +2415,21 @@ class LLMPromptNode(io.ComfyNode):
                 io.Float.Input("temperature", default=0.7, min=0.1, max=2.0, step=0.05,
                                tooltip="Creativity/randomness. Ref: Qwen ~0.7, Gemma ~1.0. Lower = focused, "
                                        "higher = varied. Range 0.1-2.0. Only used when auto_settings is OFF."),
-                io.Int.Input("max_tokens", default=2048, min=64, max=32000,
+                io.Int.Input("max_tokens", default=4096, min=64, max=32000,
                              tooltip="Max length of the result. Ref: ~512 short, 2048 a full prompt, "
-                                     "4096+ for multi-scene lists. Raise if output gets cut off. With thinking ON "
+                                     "4096 (default) for multi-scene lists. Raise if output gets cut off. With thinking ON "
                                      "the reasoning gets its own room on top (reasoning_budget, or the context)."),
-                io.Int.Input("n_ctx", default=8192, min=2048, max=262144, step=256,
+                io.Int.Input("n_ctx", default=16384, min=2048, max=262144, step=256,
                              tooltip="How much text the model reads at once (input + reasoning + output). "
-                                     "Ref: 8192 default (Krea with thinking ~7k; Gemma drafter MTP only at 8k or "
-                                     "less), 16384-32768 with images or video. Higher = more VRAM."),
+                                     "Ref: 16384 default (room for a preset, images at vision_mp 2 and a 4096 answer); "
+                                     "8192 for text only (Krea with thinking ~7k; Gemma drafter MTP up to 16k); "
+                                     "32768 with several images or video. Higher = more VRAM."),
                 io.Int.Input("seed", default=1, min=1, max=2**32 - 1,
                              tooltip="Change for a different result; same seed = same output. "
                                      "Set 'control after generate' to randomize for variety."),
-                io.Boolean.Input("keep_model_loaded", default=True,
+                io.Boolean.Input("keep_model_loaded", default=False,
                                  tooltip="ON keeps the model in VRAM (instant next run). "
-                                         "OFF frees VRAM after each run."),
+                                         "OFF (default) frees VRAM after each run."),
 
                 # ===== ADVANCED (collapsed by default via advanced=True) =====
                 # --- Manual sampling: only used when auto_settings is OFF ---
@@ -2489,8 +2491,8 @@ class LLMPromptNode(io.ComfyNode):
                 io.Boolean.Input("verbose_logging", default=False, advanced=True,
                                  tooltip="Print detailed step-by-step info to the console. OFF = quiet log; "
                                          "ON to troubleshoot. (Does not affect generation.)"),
-                io.Float.Input("vision_mp", default=0.0, min=0.0, max=8.0, step=0.1, advanced=True,
-                               tooltip="Downscale input images to at most this many megapixels before encoding. 0 = off (send at full size). ~1.0 is plenty for reference reading and saves context and time."),
+                io.Float.Input("vision_mp", default=2.0, min=0.0, max=8.0, step=0.1, advanced=True,
+                               tooltip="Downscale input images to at most this many megapixels before encoding. 0 = off (send at full size). 2.0 (default) keeps a 1080p frame whole, ~2000 tokens; 1.0 halves that for plain reference reading."),
                 io.Combo.Input("validate", options=["off", "h3"], default="off", advanced=True,
                                tooltip="Check the output's format and report findings on the `log` output. 'h3' checks MiniMax H3 prompts: section names and order, no mixing of the 3-field and 6-section formats, shot numbering, cut timestamps, labels, dialogue tags. Only the S.SS in an alignment line is repaired, and only when `frames` is wired."),
                 # Last widget on purpose: saved workflows store widget values by

@@ -133,7 +133,7 @@ The node shows only what you change for every prompt: the model, the preset, you
   | Ultra | unlimited | 3 | ~50 s |
 
   MTP does not change the text, only the speed; a model without MTP heads skips it, except Gemma 4, which uses
-  its drafter (2 draft tokens) at a context of 8k or less - see `mtp_draft_tokens` below. With thinking on and
+  its drafter (2 draft tokens) at a context of 16k or less - see `mtp_draft_tokens` below. With thinking on and
   `auto_settings` on, the family's official thinking-mode sampling is used.
 - **Last run** - time, tokens, tokens per second, how long it thought, and a `view thinking` link.
 - **✎ idea** - a large editor for your idea (Ctrl+Enter saves, Esc cancels).
@@ -164,7 +164,7 @@ All settings (the ones not on the face are in the ⚙ panel):
 | `split_output` | Splits model output into `positive` and `negative`. |
 | `auto_settings` | Applies recommended sampling and thinking controls for known model families. |
 | `disable_thinking` | Disables/strips reasoning where supported. |
-| `temperature`, `max_tokens`, `n_ctx`, `seed`, `keep_model_loaded` | Main generation/runtime controls. `n_ctx` defaults to 8192: enough for any text run (Krea with thinking ~7k); use 16k-32k with images or video. |
+| `temperature`, `max_tokens`, `n_ctx`, `seed`, `keep_model_loaded` | Main generation/runtime controls. `n_ctx` defaults to 16384: a preset, images at `vision_mp` 2 and a 4096-token answer fit; 8192 is enough for a text run (Krea with thinking ~7k) and costs the Gemma drafter less VRAM; use 32k with several images or video. Defaults: `split_output` off, `keep_model_loaded` off, `max_tokens` 4096. |
 | `load_mmproj` | Whether to pair the model with its vision projector. `auto` (default) loads it only when image/video/audio is connected, which frees ~0.6-1.1 GB of VRAM and the reserved image-token budget on text-only runs. `always` keeps it loaded so bypassing an image node does not change the load signature and force a full model reload. `never` is text-only regardless. VL models always keep their projector. |
 
 Advanced widgets:
@@ -189,8 +189,8 @@ vision_mp
 validate
 ```
 
-`vision_mp` downscales input images to at most that many megapixels before encoding (0 = full
-size). `validate = h3` checks MiniMax H3 prompt format and reports on `log`.
+`vision_mp` downscales input images to at most that many megapixels before encoding (default 2.0,
+about 2000 tokens per image on Qwen VL; 0 = full size). `validate = h3` checks MiniMax H3 prompt format and reports on `log`.
 
 `mtp_draft_tokens` turns on MTP (multi-token prediction): the model's own MTP heads guess 2-3 tokens
 ahead and the model verifies them, so quality is unchanged and writing is about 2x faster (Qwen3.6 27B
@@ -203,7 +203,7 @@ Gemma 4 has no MTP heads of its own; Google publishes separate drafters (`mtp-ge
 `mtp-gemma-4-26B-A4B-it.gguf`, `mtp-gemma-4-E4B-it.gguf`, architecture `gemma4-assistant`). Put them anywhere in
 your LLM folders (e.g. `LLM/_mtp_drafters/`): they are hidden from the model list and paired automatically with
 any Gemma 4 model of the same width, fine-tunes included. The drafter needs llama-cpp-python 0.4.x and a
-context of 8k or less (the default), because it turns on `swa_full`, whose VRAM grows with the context.
+context of 16k or less (the default), because it turns on `swa_full`, whose VRAM grows with the context.
 Measured on Gemma4 26B-A4B Q4_K_P, RTX 4090: 157 -> 184 tok/s for +1.4 GB at 8k (+0.6 GB at 4k, +2.9 GB at
 16k, where the node leaves it off). The model card shows `MTP drafter` when one is found.
 
