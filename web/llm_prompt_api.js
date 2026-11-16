@@ -43,6 +43,23 @@ const PROVIDERS = {
             // users") for pro, flash AND flash-lite.
         ],
     },
+    // Vertex express key: it cannot list models, so the list is fixed (Python side).
+    "Gemini (Vertex)": {
+        defaultUrl: "https://aiplatform.googleapis.com/v1/publishers/google",
+        liveModels: false,
+        needsAuth: true,
+        envVar: "VERTEX_API_KEY",
+        fallback: [
+            "gemini-3.8-flash",
+            "gemini-3.7-flash",
+            "gemini-3.6-flash",
+            "gemini-3.5-flash",
+            "gemini-3.5-flash-lite",
+            "gemini-3.1-pro-preview",
+            "gemini-3.1-flash-lite",
+            "gemini-3-flash-preview",
+        ],
+    },
     "Grok (xAI)": {
         defaultUrl: "https://api.x.ai/v1",
         liveModels: true,
@@ -228,6 +245,13 @@ async function refreshModels(node, preserveValue = false) {
     // superseded.
     node.__llmRefreshGen = (node.__llmRefreshGen || 0) + 1;
     const gen = node.__llmRefreshGen;
+
+    // A deliberate provider change shows this provider's own list at once; the
+    // live list below replaces it when the server answers.
+    if (!preserveValue) {
+        const quick = cfg.fallback.filter((m) => shouldShow(m, filterMode, provider));
+        updateModelDropdown(node, quick.length > 0 ? quick : [...cfg.fallback], false);
+    }
 
     // The browser has no API keys (env / .env live on the server), so we ask
     // the server route for the live list. It runs _get_models_for_provider()

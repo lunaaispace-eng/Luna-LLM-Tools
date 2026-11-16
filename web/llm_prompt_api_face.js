@@ -15,7 +15,7 @@
 // run would not send. Plan: plans/api-node-ui.md (mockup approved 2026-10-12).
 
 import { app } from "/scripts/app.js";
-import { closePanel, isPanelOpenFor, openPanel, recentlyClosed, refreshPanel } from "./llm_prompt_panel.mjs?v=7";
+import { closePanel, isPanelOpenFor, openPanel, recentlyClosed, refreshPanel } from "./llm_prompt_panel.mjs?v=8";
 
 const NODE = "Luna-LLMPromptAPI";
 const FACE = "llm_api_face";

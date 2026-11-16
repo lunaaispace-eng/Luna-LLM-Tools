@@ -1646,6 +1646,8 @@ def _send_gemini_native(
 # HTTP chat completion (OpenAI-compatible — LM Studio, Grok, Custom)
 # ---------------------------------------------------------------------------
 
+_HIGH_EFFORT_TIMEOUT = 300.0  # seconds, the least a high / xhigh reasoning call gets
+
 def _send_chat_completion(
     provider: str,
     base_url: str,
@@ -1707,6 +1709,14 @@ def _send_chat_completion(
 
     # Per-provider sanitization
     payload = _sanitize_payload_for_provider(provider, payload)
+
+    # High reasoning on a long preset outlasts the 120 s default (grok-4.7, 8k-token
+    # prompt: two 120 s timeouts at high, 95 s at medium, 2026-11-16). A floor, so a
+    # higher timeout_seconds still wins.
+    if payload.get("reasoning_effort") in ("high", "xhigh") and timeout < _HIGH_EFFORT_TIMEOUT:
+        print(f"[Luna-LLMPromptAPI] reasoning_effort={payload['reasoning_effort']}: "
+              f"timeout raised {timeout:.0f}s -> {_HIGH_EFFORT_TIMEOUT:.0f}s")
+        timeout = _HIGH_EFFORT_TIMEOUT
 
     body = json.dumps(payload).encode("utf-8")
 
@@ -1958,7 +1968,7 @@ def _send_codex_cli(model: str, messages: list[dict], timeout: float, reasoning_
     return answer
 
 
-_GROK_CMDLINE_BUDGET = 30000  # Windows CreateProcess caps a command line at 32767 chars
+_GROK_IMAGE_SIDE = 768  # longest side (the old sender's top size) of each image sent to the Grok CLI
 
 
 def _send_grok_cli(model: str, messages: list[dict], timeout: float, reasoning_effort: str) -> str:
@@ -1982,36 +1992,26 @@ def _send_grok_cli(model: str, messages: list[dict], timeout: float, reasoning_e
             base += ["--system-prompt-override", system]
         elif system:
             body = f"INSTRUCTIONS:\n{system}\n\n---\n\n{body}"
-        blocks = [{"type": "text", "text": body}]
         note = ""
         if images:
-            room = _GROK_CMDLINE_BUDGET - len(" ".join(base)) - len(json.dumps(blocks)) - 200
-            sent = []
-            for side in (768, 512, 384, 256, 192):
-                sent = []
-                for b in images:
-                    im = _Image.open(_stdio.BytesIO(_b64.b64decode(b))).convert("RGB")
-                    im.thumbnail((side, side))
-                    buf = _stdio.BytesIO()
-                    im.save(buf, "JPEG", quality=80)
-                    sent.append(_b64.b64encode(buf.getvalue()).decode())
-                if sum(len(x) + 60 for x in sent) <= room:
-                    break
-            else:
-                sent = []
-            if sent:
-                blocks += [{"type": "image", "data": x, "mimeType": "image/jpeg"} for x in sent]
-                note = f"{len(sent)} image(s) at <= {side}px"
-            else:
-                note = "images DROPPED (too large for the command line)"
-                print("[Luna-LLMPromptAPI] Grok (SuperGrok): " + note)
-        if len(blocks) > 1:
-            cmd = base + ["--prompt-json", json.dumps(blocks)]
-            p_in = None
+            # --prompt-file takes the JSON content blocks too (TESTED 2026-11-16 on
+            # grok 1.0.77: a solid red and a solid blue image were both named), so
+            # images no longer compete with the text for the command line.
+            blocks = [{"type": "text", "text": body}]
+            for b in images:
+                im = _Image.open(_stdio.BytesIO(_b64.b64decode(b))).convert("RGB")
+                im.thumbnail((_GROK_IMAGE_SIDE, _GROK_IMAGE_SIDE))
+                buf = _stdio.BytesIO()
+                im.save(buf, "JPEG", quality=85)
+                blocks.append({"type": "image", "data": _b64.b64encode(buf.getvalue()).decode(),
+                               "mimeType": "image/jpeg"})
+            pf = Path(wd) / "prompt.json"
+            pf.write_text(json.dumps(blocks), encoding="utf-8")
+            note = f"{len(images)} image(s) at <= {_GROK_IMAGE_SIDE}px"
         else:
             pf = Path(wd) / "prompt.md"
             pf.write_text(body, encoding="utf-8")
-            cmd = base + ["--prompt-file", str(pf)]
+        cmd = base + ["--prompt-file", str(pf)]
         t0 = time.perf_counter()
         p = _cli_run(cmd, input_text=None, cwd=wd, timeout=timeout, env=env)
     try:
@@ -2684,7 +2684,7 @@ class LLMPromptAPINode(io.ComfyNode):
                 io.Boolean.Input("disable_thinking", default=True, advanced=True,
                                  tooltip="Strips any <think> reasoning from the OUTPUT as a safety net. For Gemini, set the thinking budget/level to 0/None to disable at the source."),
                 io.Int.Input("timeout_seconds", default=120, min=5, max=600, advanced=True,
-                             tooltip="HTTP timeout for the chat call. Raise to 180+ for big reasoning models."),
+                             tooltip="HTTP timeout for the chat call. A call at reasoning high or xhigh waits at least 300 s, whatever this says."),
                 io.Float.Input("vision_mp", default=0.0, min=0.0, max=8.0, step=0.1, advanced=True,
                                tooltip="Downscale input images to at most this many megapixels before encoding. 0 = off (send at full size). ~1.0 is plenty for reference reading and saves context and time."),
                 io.Combo.Input("validate", options=["off", "h3"], default="off", advanced=True,
