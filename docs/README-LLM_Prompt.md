@@ -209,7 +209,7 @@ Measured on Gemma4 26B-A4B Q4_K_P, RTX 4090: 157 -> 184 tok/s for +1.4 GB at 8k 
 
 `reasoning_budget` caps the thinking when thinking is on, like LM Studio's budget: -1 = unlimited, 0 = no
 thinking, N = after N reasoning tokens the model is told to stop and writes the prompt. Qwen 3.5+ and Gemma 4
-only. Measured with `Krea2_Architect_General_V1` on Qwen3.6 27B + MTP 3: unlimited thinking ran ~4,500 tokens
+only. Measured with the Krea2 General preset (since removed) on Qwen3.6 27B + MTP 3: unlimited thinking ran ~4,500 tokens
 (56 s); 2048 gave a near-identical prompt in 32 s, 1024 a slightly shorter one in 21 s, 512 a complete but less
 detailed one in 15 s.
 
@@ -527,42 +527,30 @@ Current preset files:
 
 ```text
 Backgrounds.md
-Chroma.md
-Chroma_Negative.md
-Chroma_dynamic.md
-Chroma_dynamic_Negative.md
+describe_image.md
 Ideogram4 Architect v4.md
 Ideogram_Prompt.md
-Juggernaut Z_Image.md
-Krea2_Architect_Adult_NSFW.md
-Krea2_Architect_Adult_NSFW_V1.md
-Krea2_Architect_General.md
-Krea2_Architect_General_V1.md
-MinimaxH3_I2V_Architect.md
-MinimaxH3_Ref2VA_Architect.md
-MinimaxH3_T2V_Architect.md
-MinimaxH3_i2v_Vision.md
-MinimaxH3_ref2va_Vision.md
-PromptArchitectDynamicNegativeLabels.md
-PromptArchitectLabels.md
-PromptArchitectNegativeLabels.md
-Z-Image_Prompt_Architect.md
-describe_image.md
 illustrious.md
 image_analysis.md
 image_caption.md
 image_edit.md
+Krea2_Architect_Adult_NSFW.md
+MinimaxH3_I2V_Architect.md
+MinimaxH3_i2v_Vision.md
+MinimaxH3_Image_Edit.md
+MinimaxH3_Ref2VA_Architect.md
+MinimaxH3_Ref2VA_Song_Architect.md
+MinimaxH3_ref2va_Vision.md
+MinimaxH3_T2V_Architect.md
 multi_image_compose.md
 pony.md
 prompt Architect.md
-prompt_architect_dynamic.md
-prompt_architect_dynamic_negative.md
 prompt_architect_negative.md
+Qwen_Image_2.1_Edit.md
 reverse_engineered_prompt.md
 sdxl.md
 style_transfer_prompt.md
 tags.md
-z_image.md
 ```
 
 ## Dataset Captioning

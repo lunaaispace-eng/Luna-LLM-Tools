@@ -198,6 +198,11 @@ class WriterApiCoreTest(unittest.TestCase):
         self.assertEqual(text, f"{canvas}\n\nSTYLE:\nink wash\n\nREFERENCE CONTEXT:\nfox, winter"
                                f"\n\nUSER REQUEST:\na red fox in snow")
 
+    def test_asset_brief_is_a_pictures_block_before_the_context(self):
+        _, rec = self._execute(context="fox, winter", asset_brief="<Picture 1> = 1920x1080 (16:9, landscape)")
+        self.assertEqual(rec.messages()[1]["content"], "PICTURES:\n<Picture 1> = 1920x1080 (16:9, landscape)"
+                         "\n\nREFERENCE CONTEXT:\nfox, winter\n\nUSER REQUEST:\na red fox in snow")
+
     def test_chat_completion_call_openai_custom_grok(self):
         cases = (("OpenAI", "", "https://api.openai.com/v1"),
                  ("Custom", "http://localhost:1234/v1/", "http://localhost:1234/v1"),
@@ -334,7 +339,7 @@ class WriterApiCoreTest(unittest.TestCase):
             "gemini_thinking_level", "enable_caching", "disable_thinking", "timeout_seconds",
             "auto_settings", "reasoning_effort", "server_url", "validate", "frames", "video",
             "video_input_mode", "video_sample_frames", "gemini_video_fps", "quality",
-            "min_p", "repeat_penalty", "context_length", "unload_after_run", "audio"])
+            "min_p", "repeat_penalty", "context_length", "unload_after_run", "audio", "asset_brief"])
         self.assertTrue(all(p.kind is inspect.Parameter.KEYWORD_ONLY for p in params.values()))
         schema = self._schema()
         widgets = {i.id: getattr(i, "default", None) for i in schema.inputs}
@@ -359,7 +364,7 @@ class WriterApiCoreTest(unittest.TestCase):
             "disable_thinking", "timeout_seconds", "vision_mp", "validate", "auto_settings",
             "reasoning_effort", "style", "context", "width", "height", "image", "video", "audio",
             "frames", "video_input_mode", "video_sample_frames", "gemini_video_fps", "quality",
-            "min_p", "repeat_penalty", "context_length", "unload_after_run"])
+            "min_p", "repeat_penalty", "context_length", "unload_after_run", "asset_brief"])
 
 
 if __name__ == "__main__":

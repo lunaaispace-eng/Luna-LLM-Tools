@@ -107,6 +107,11 @@ class GGUFWriterCoreTest(unittest.TestCase):
         self.assertEqual(rec["invoke"]["media_content"], [])
         self.assertEqual(rec["invoke"]["user_prompt"], "USER PROMPT:\na red fox in snow")
 
+    def test_asset_brief_is_a_pictures_block_before_the_prompt(self):
+        _, rec = self._generate(asset_brief="<Picture 1> = 1920x1080 (16:9, landscape)")
+        self.assertEqual(rec["invoke"]["user_prompt"],
+                         "PICTURES:\n<Picture 1> = 1920x1080 (16:9, landscape)\n\nUSER PROMPT:\na red fox in snow")
+
     def test_media_dropped_without_handler(self):
         _, rec = self._generate(handler=False, image=_tensor())
         self.assertTrue(rec["load"]["want_vision"])

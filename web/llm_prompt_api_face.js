@@ -315,7 +315,7 @@ const FAMILIES = [
 const familyOf = (title) => (FAMILIES.find(([re]) => re.test(title || "")) || [])[1] || "";
 
 const INPUT_CHIPS = [["style", "style"], ["context", "context"], ["width", "size"], ["image", "image"],
-    ["video", "video"], ["audio", "audio"]];
+    ["video", "video"], ["audio", "audio"], ["asset_brief", "pictures"]];
 
 function renderProviders(node, root) {
     const info = infoOf(node);

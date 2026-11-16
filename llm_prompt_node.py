@@ -233,27 +233,19 @@ def _build_canvas_profile(width: int, height: int) -> str:
 # ---------------------------------------------------------------------------
 
 def load_system_prompts() -> dict[str, str]:
-    """Load all .md files from prompts/ folder, then prompts/private/.
+    """Load all .md files from the prompts/ folder (not its subfolders).
 
     Each file becomes a preset. Optional YAML frontmatter (between --- markers)
     can set: title: Display Name Override
 
-    prompts/private/ is git-ignored: presets that are fine to use locally but
-    must not be published (e.g. third-party prompts licensed "use in your own
-    projects, do not republish"). Their titles get a "Private: " prefix so they
-    never collide with a published preset.
+    prompts/private/ is not read (excluded 2026-11-16, `SPEC.md` § 1).
     """
     prompts = {}
     if not PROMPTS_DIR.exists():
         PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
         return prompts
 
-    private_dir = PROMPTS_DIR / "private"
-    files = [(f, "") for f in sorted(PROMPTS_DIR.glob("*.md"))]
-    if private_dir.is_dir():
-        files += [(f, "Private: ") for f in sorted(private_dir.glob("*.md"))]
-
-    for md_file, prefix in files:
+    for md_file in sorted(PROMPTS_DIR.glob("*.md")):
         try:
             text = md_file.read_text(encoding="utf-8").strip()
         except Exception:
@@ -277,7 +269,7 @@ def load_system_prompts() -> dict[str, str]:
                 content = text
 
         if content:
-            prompts[prefix + title] = content
+            prompts[title] = content
 
     return prompts
 
@@ -2085,6 +2077,7 @@ class _LLMRunner:
         moe_cpu_layers: int = 0,
         moe_cache_mib: int = 0,
         moe_cache_cpu_share: float = 0.0,
+        asset_brief: str = "",
         media_override: list[dict] | None = None,
     ):
         # Gate the chatty status prints for this run (warnings/errors still show).
@@ -2209,6 +2202,10 @@ class _LLMRunner:
             canvas_block = _build_canvas_profile(eff_w, eff_h)
             if canvas_block:
                 parts.append(canvas_block)
+        # The picture inventory (Luna-H3-AssetLoader's asset_brief) right after the canvas:
+        # which wired picture is <Picture N>, at its true size.
+        if asset_brief and asset_brief.strip():
+            parts.append(f"PICTURES:\n{asset_brief.strip()}")
         # Upstream analysis (stage 1 of a two-stage graph) reads before the request,
         # so the bulky reference material lands first and the instruction lands last.
         if context and context.strip():
@@ -2541,6 +2538,11 @@ class LLMPromptNode(io.ComfyNode):
                 io.Audio.Input("audio", optional=True, tooltip="Audio input (Gemma-4 audio projector only)."),
                 io.Int.Input("frames", optional=True, force_input=True,
                              tooltip="The clip's real frame count, for `validate`. Lets S.SS and the cut times be checked against the actual duration instead of just their format."),
+                # Added last (2026-11-16): a socket-only input, so saved widget positions are unchanged.
+                io.String.Input("asset_brief", optional=True, force_input=True,
+                                tooltip="The asset_brief from Luna-H3-AssetLoader: one line naming each wired picture as <Picture N> with its true "
+                                        "size and ratio. Sent as a PICTURES block, so a prompt writer knows which picture is which "
+                                        "and each one's real shape even when the images batch is letterboxed."),
             ],
             outputs=[
                 io.String.Output("positive", display_name="positive"),

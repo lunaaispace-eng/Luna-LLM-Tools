@@ -290,7 +290,7 @@ function refreshModel(node, force = false) {
 }
 
 const INPUT_CHIPS = [["user_prompt", "idea"], ["style", "style"], ["context", "context"], ["width", "size"], ["image", "image"],
-    ["reference_image", "reference"], ["video", "video"], ["audio", "audio"]];
+    ["reference_image", "reference"], ["video", "video"], ["audio", "audio"], ["asset_brief", "pictures"]];
 
 function renderModel(node, root) {
     const info = _info.get(widget(node, "model_name")?.value);

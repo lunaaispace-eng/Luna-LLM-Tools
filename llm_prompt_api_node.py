@@ -2257,6 +2257,7 @@ def write_prompt_api(
     context_length: int = 8192,
     unload_after_run: bool = True,
     audio=None,
+    asset_brief: str = "",
 ) -> tuple[str, str, str]:
     """The Luna-LLMPromptAPI writer: build the messages, call the provider, clean and split.
 
@@ -2440,6 +2441,10 @@ def write_prompt_api(
         stable_parts.append(f"STYLE:\n{style.strip()}")
 
     variable_parts: list[str] = []
+    # The picture inventory (Luna-H3-AssetLoader's asset_brief): which wired picture
+    # is <Picture N>, at its true size. Variable: it changes with the pictures.
+    if asset_brief and asset_brief.strip():
+        variable_parts.append(f"PICTURES:\n{asset_brief.strip()}")
     # Upstream analysis (stage 1 of a two-stage graph). Variable, not stable:
     # it changes every run, so it must stay OUT of the Gemini cache prefix.
     if context and context.strip():
@@ -2744,6 +2749,12 @@ class LLMPromptAPINode(io.ComfyNode):
                              tooltip="LM Studio only: the context to load a model with when this node loads it. 0 = the model's LM Studio default. A model that is already loaded (by you or Luna Bridge) is used as it is - a different value would make LM Studio load a second copy."),
                 io.Boolean.Input("unload_after_run", default=True, advanced=True,
                                  tooltip="LM Studio only. ON = unload the model after the run, but only if this run loaded it. A model that was already loaded stays loaded."),
+                # Added last (2026-11-16): a socket-only input, so saved widget positions are unchanged.
+                io.String.Input("asset_brief", optional=True, force_input=True,
+                                tooltip="The asset_brief from Luna-H3-AssetLoader: one line naming each wired picture as "
+                                        "<Picture N> with its true size and ratio. Sent as a PICTURES block, so the "
+                                        "model knows which picture is which and each one's real shape even when the "
+                                        "image batch is letterboxed."),
             ],
             outputs=[
                 io.String.Output("positive", display_name="positive"),
@@ -2809,6 +2820,7 @@ class LLMPromptAPINode(io.ComfyNode):
         context_length: int = 8192,
         unload_after_run: bool = True,
         audio=None,
+        asset_brief: str = "",
     ):
         # Provider and video-mode errors first, as before the writer core existed.
         _cfg, native_video = _video_route(provider, model_name, video, video_input_mode)
@@ -2858,6 +2870,7 @@ class LLMPromptAPINode(io.ComfyNode):
             video_sample_frames=video_sample_frames, gemini_video_fps=gemini_video_fps,
             quality=quality, min_p=min_p, repeat_penalty=repeat_penalty,
             context_length=context_length, unload_after_run=unload_after_run, audio=audio,
+            asset_brief=asset_brief,
         )
         # Sampled frames are this node's work, so their log line is added here,
         # ahead of the validation report, as before.

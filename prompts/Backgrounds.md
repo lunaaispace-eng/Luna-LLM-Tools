@@ -1,5 +1,5 @@
 ---
-title: Backrounds
+title: Backgrounds
 ---
 
 {
