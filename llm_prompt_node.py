@@ -601,6 +601,47 @@ def _sample_video_frames(video, frame_count: int):
     return [video[i] for i in idx]
 
 
+def _refs_pictures(refs) -> list[tuple[str, "torch.Tensor"]]:
+    """The pictures of a LUNA_H3_REFS payload as (label, [H,W,3] frame) pairs, in order.
+
+    Sources: Luna-H3-AssetLoader and Luna-ImageLoader `refs`. Label "Image N (role, WxH)",
+    or "Image N (WxH)" when the payload has no `roles` entry for it. N is the picture's
+    1-based place in refs["images"]; WxH is its own size as received. Only the first frame
+    of a batch tensor is used. A missing or empty entry is skipped and the others keep
+    their numbers. Both writers use this, so the labels are the same on every route.
+    """
+    if not isinstance(refs, dict):
+        return []
+    roles = refs.get("roles") or []
+    out: list[tuple[str, torch.Tensor]] = []
+    for i, img in enumerate(refs.get("images") or []):
+        if img is None or not hasattr(img, "ndim"):
+            continue
+        if img.ndim == 4:
+            if int(img.shape[0]) == 0:
+                continue
+            img = img[0]
+        if img.ndim != 3 or int(img.shape[0]) == 0 or int(img.shape[1]) == 0:
+            continue
+        h, w = int(img.shape[0]), int(img.shape[1])
+        role = roles[i].strip() if i < len(roles) and isinstance(roles[i], str) else ""
+        out.append((f"Image {i + 1} ({role}, {w}x{h})" if role else f"Image {i + 1} ({w}x{h})", img))
+    return out
+
+
+def _refs_brief(asset_brief, refs) -> str:
+    """The text of the PICTURES block: a wired asset_brief wins, else refs["brief"], else ""."""
+    if asset_brief and str(asset_brief).strip():
+        return str(asset_brief)
+    brief = refs.get("brief") if isinstance(refs, dict) else None
+    return brief if isinstance(brief, str) else ""
+
+
+def _pictures_log(counts: list[tuple[str, int]]) -> str:
+    """One log line naming how many pictures each input sent, e.g. "Pictures: 1 from image, 3 from refs."."""
+    return "Pictures: " + ", ".join(f"{n} from {name}" for name, n in counts if n) + "."
+
+
 def _pick_device(device_choice: str) -> str:
     if device_choice == "auto":
         if torch.cuda.is_available():
@@ -2078,6 +2119,7 @@ class _LLMRunner:
         moe_cache_mib: int = 0,
         moe_cache_cpu_share: float = 0.0,
         asset_brief: str = "",
+        refs=None,
         media_override: list[dict] | None = None,
     ):
         # Gate the chatty status prints for this run (warnings/errors still show).
@@ -2203,7 +2245,9 @@ class _LLMRunner:
             if canvas_block:
                 parts.append(canvas_block)
         # The picture inventory (Luna-H3-AssetLoader's asset_brief) right after the canvas:
-        # which wired picture is <Picture N>, at its true size.
+        # which wired picture is <Picture N>, at its true size. Without a wired asset_brief,
+        # the brief carried in `refs` takes its place.
+        asset_brief = _refs_brief(asset_brief, refs)
         if asset_brief and asset_brief.strip():
             parts.append(f"PICTURES:\n{asset_brief.strip()}")
         # Upstream analysis (stage 1 of a two-stage graph) reads before the request,
@@ -2231,6 +2275,7 @@ class _LLMRunner:
         # media_override (luna_writer_api) is a ready content list that
         # replaces this whole assembly; the node never passes it.
         media_content: list[dict] = []
+        picture_counts: list[tuple[str, int]] = []
 
         if media_override is not None:
             media_content = list(media_override)
@@ -2244,18 +2289,29 @@ class _LLMRunner:
                     media_content.append({"type": "text", "text": "Input Image:"})
                 for fr in img_frames:
                     media_content.append(_image_tensor_to_content(fr, max_mp=vision_mp))
+                picture_counts.append(("image", len(img_frames)))
 
             # Reference image for style-transfer prompts.
             if reference_image is not None:
                 media_content.append({"type": "text", "text": "Reference Image:"})
                 ref_frame = reference_image[0] if reference_image.ndim == 4 else reference_image
                 media_content.append(_image_tensor_to_content(ref_frame, max_mp=vision_mp))
+                picture_counts.append(("reference_image", 1))
 
             # Video frames, FPS-subsampled and context-budget aware.
             if video is not None:
                 media_content.extend(
                     _video_tensor_to_contents(video, target_fps=video_fps, n_ctx=n_ctx)
                 )
+
+            # The pictures in `refs`, after the other media: each at its own shape
+            # (vision_mp is the only shrink), each right after its "Image N (...)" label.
+            ref_pictures = _refs_pictures(refs)
+            for label, frame in ref_pictures:
+                media_content.append({"type": "text", "text": label})
+                media_content.append(_image_tensor_to_content(frame, max_mp=vision_mp))
+            if ref_pictures:
+                picture_counts.append(("refs", len(ref_pictures)))
 
             # Audio (Gemma-4 audio projector only). Never hard-fail on audio issues.
             if audio is not None:
@@ -2321,9 +2377,14 @@ class _LLMRunner:
             positive, negative = split_positive_negative(result, split_output)
 
             log = ""
-            if negative_dropped(result, split_output):
-                log = NEGATIVE_DROPPED_NOTE
+            # How many pictures each input sent, when `refs` sent any (only when the
+            # projector took the media).
+            if any(name == "refs" for name, _ in picture_counts) and self.chat_handler is not None:
+                log = _pictures_log(picture_counts)
                 print(f"[Luna-LLMPrompt] {log}")
+            if negative_dropped(result, split_output):
+                log = f"{log}\n{NEGATIVE_DROPPED_NOTE}" if log else NEGATIVE_DROPPED_NOTE
+                print(f"[Luna-LLMPrompt] {NEGATIVE_DROPPED_NOTE}")
             if validate == "h3":
                 positive, findings = validate_h3(positive, frames or None)
                 report = format_log(positive, frames or None, findings)
@@ -2543,6 +2604,13 @@ class LLMPromptNode(io.ComfyNode):
                                 tooltip="The asset_brief from Luna-H3-AssetLoader: one line naming each wired picture as <Picture N> with its true "
                                         "size and ratio. Sent as a PICTURES block, so a prompt writer knows which picture is which "
                                         "and each one's real shape even when the images batch is letterboxed."),
+                # Added last (S7): a socket-only input, so saved widget positions are unchanged.
+                io.Custom("LUNA_H3_REFS").Input(
+                    "refs", optional=True,
+                    tooltip="Pictures to look at, each at its own size: wire Luna-ImageLoader `refs` or "
+                            "Luna-H3-AssetLoader `refs`. Each is sent after the image / reference_image / video "
+                            "media as 'Image N (role, WxH)' then the picture; vision_mp is the only shrink. "
+                            "Without a wired asset_brief, the brief in refs becomes the PICTURES block."),
             ],
             outputs=[
                 io.String.Output("positive", display_name="positive"),

@@ -89,7 +89,7 @@ class SchemaAndStatsTests(unittest.TestCase):
             self.assertTrue(i.optional, i.id)
         for i in inputs[at + len(moe):]:
             self.assertTrue(getattr(i, "force_input", False) or type(i).__name__ != "Input"
-                            or i.id in ("image", "reference_image", "video", "audio"), i.id)
+                            or i.id in ("image", "reference_image", "video", "audio", "refs"), i.id)
 
     def test_quant_from_filename(self):
         f = lambda s: self.node._QUANT_RE.findall(s)[-1].upper()  # noqa: E731

@@ -28,8 +28,8 @@ Each node needs only its own part:
 
 ## Node tree
 
-- **Luna-LLMPrompt**: Writes prompts with a local GGUF model (llama-cpp).
-- **Luna-LLMPromptAPI**: Writes prompts with cloud, LM Studio or subscription models.
+- **Luna-LLMPrompt**: Writes prompts with a local GGUF model (llama-cpp); reads pictures from Luna-ImageLoader `refs`.
+- **Luna-LLMPromptAPI**: Writes prompts with cloud, LM Studio or subscription models; reads Luna-ImageLoader `refs` too.
 - **Luna-StylePrompt**: Picks an image style from a categorized library.
 - **Luna-CombineStyles**: Blends up to 3 styles; the first one leads.
 - **Luna-LoadImageForCaption**: Loads the next uncaptioned image in a folder, one per run.

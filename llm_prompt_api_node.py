@@ -39,6 +39,9 @@ from .llm_prompt_node import (
     _tensor_to_base64_png,
     _sample_video_frames,
     _resolve_model_settings,
+    _refs_pictures,
+    _refs_brief,
+    _pictures_log,
 )
 from .output_cleaner import (OutputCleanConfig, clean_model_output, normalize_prompt_separator, split_positive_negative,
                              negative_dropped, NEGATIVE_DROPPED_NOTE)
@@ -1815,16 +1818,23 @@ def _send_chat_completion(
 # Image / video message builders
 # ---------------------------------------------------------------------------
 
-def _build_multimodal_user_content(text: str, images_b64: list[str]) -> list[dict]:
-    """Build OpenAI-style multimodal user content array (text + image_url blocks)."""
+def _build_multimodal_user_content(text: str, images_b64: list[str],
+                                   labelled_images: list[tuple[str, str]] | None = None) -> list[dict]:
+    """Build OpenAI-style multimodal user content array (text + image_url blocks).
+
+    labelled_images: (label, base64 PNG) pairs, after the plain images, each sent as a text
+    block with its label and then its image.
+    """
+    def image_block(b64: str) -> dict:
+        return {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}
+
     parts: list[dict] = [{"type": "text", "text": text}]
     for img_b64 in images_b64:
-        if not img_b64:
-            continue
-        parts.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:image/png;base64,{img_b64}"},
-        })
+        if img_b64:
+            parts.append(image_block(img_b64))
+    for label, img_b64 in labelled_images or []:
+        if img_b64:
+            parts += [{"type": "text", "text": label}, image_block(img_b64)]
     return parts
 
 
@@ -1832,25 +1842,75 @@ def _build_multimodal_user_content(text: str, images_b64: list[str]) -> list[dic
 # Subscription CLI routes (Claude Max / Codex ChatGPT / SuperGrok)
 # ---------------------------------------------------------------------------
 
-def _cli_split_messages(messages: list[dict]) -> tuple[str, str, list[str]]:
-    """OpenAI-style messages -> (system text, user text, [base64 PNG])."""
-    system, text, images = "", "", []
+# A picture label from _refs_pictures: "Image N (role, WxH)" or "Image N (WxH)".
+_IMAGE_LABEL_RE = re.compile(r"^Image \d+ \([^()\n]*\)$")
+
+
+def _cli_parts(messages: list[dict]) -> tuple[str, list[str], list[tuple[str, str]]]:
+    """OpenAI-style messages -> (system text, [user text parts], [(label, base64 PNG)]), in order.
+
+    A text part that matches _IMAGE_LABEL_RE and stands right before an image is that
+    image's label and is not counted as user text; an image without one has label "".
+    """
+    system, texts, images = "", [], []
     for m in messages:
         content = m.get("content")
         if m.get("role") == "system":
             system = content if isinstance(content, str) else ""
             continue
         if isinstance(content, str):
-            text = content
-        elif isinstance(content, list):
-            for part in content:
-                if part.get("type") == "text":
-                    text = part.get("text", "")
-                elif part.get("type") == "image_url":
-                    url = (part.get("image_url") or {}).get("url", "")
-                    if "," in url:
-                        images.append(url.split(",", 1)[1])
-    return system, text, images
+            texts.append(content)
+            continue
+        if not isinstance(content, list):
+            continue
+        pending = None  # a label text waiting for its image
+        for part in content:
+            kind = part.get("type")
+            if kind == "image_url":
+                url = (part.get("image_url") or {}).get("url", "")
+                if "," in url:
+                    images.append((pending or "", url.split(",", 1)[1]))
+                elif pending is not None:
+                    texts.append(pending)
+                pending = None
+                continue
+            if pending is not None:
+                texts.append(pending)
+                pending = None
+            if kind == "text":
+                t = part.get("text", "")
+                if _IMAGE_LABEL_RE.match(t or ""):
+                    pending = t
+                else:
+                    texts.append(t)
+        if pending is not None:
+            texts.append(pending)
+    return system, texts, images
+
+
+def _cli_image_order(images: list[tuple[str, str]]) -> str:
+    """For a route that cannot put text between images: the labels, in the order the
+    images are attached. "" when no image has a label."""
+    if not any(label for label, _ in images):
+        return ""
+    lines = [f"{k}. {label or 'an image from the image or video input'}"
+             for k, (label, _) in enumerate(images, 1)]
+    return "IMAGES, in the order attached:\n" + "\n".join(lines)
+
+
+def _cli_split_messages(messages: list[dict]) -> tuple[str, str, list[str]]:
+    """OpenAI-style messages -> (system text, user text, [base64 PNG]).
+
+    The user text is every text part, in order. When images carry labels, the labels
+    follow as an "IMAGES, in the order attached" block, for routes that attach the
+    images apart from the text.
+    """
+    system, texts, images = _cli_parts(messages)
+    text = "\n\n".join(t for t in texts if t) if len(texts) > 1 else (texts[0] if texts else "")
+    order = _cli_image_order(images)
+    if order:
+        text = f"{text}\n\n{order}" if text else order
+    return system, text, [b for _, b in images]
 
 
 def _cli_exe(name: str, extra: list[str]) -> str:
@@ -1897,10 +1957,19 @@ def _cli_run(cmd: list[str], *, input_text: str | None, cwd: str, timeout: float
 def _send_claude_cli(model: str, messages: list[dict], timeout: float, reasoning_effort: str) -> str:
     """Claude Code headless on the Max login. Live-tested 2026-10-04."""
     exe = _cli_exe("claude", [str(Path.home() / ".local" / "bin" / "claude.exe")])
-    system, text, images = _cli_split_messages(messages)
-    content = [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b}}
-               for b in images]
+    system, texts, pictures = _cli_parts(messages)
+    text = "\n\n".join(t for t in texts if t)
+
+    def block(b):
+        return {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b}}
+    # Unlabelled images ahead of the text, as before; a labelled image after it, right
+    # after its own label (the stream-json content takes text and images in any order).
+    content = [block(b) for label, b in pictures if not label]
     content.append({"type": "text", "text": text or "Describe a scene vividly."})
+    for label, b in pictures:
+        if label:
+            content += [{"type": "text", "text": label}, block(b)]
+    images = [b for _, b in pictures]
     line = json.dumps({"type": "user", "message": {"role": "user", "content": content}})
     with _cli_workdir() as wd:
         cmd = [exe, "-p", "--model", model, "--tools", "", "--strict-mcp-config",
@@ -1978,7 +2047,9 @@ def _send_grok_cli(model: str, messages: list[dict], timeout: float, reasoning_e
     from PIL import Image as _Image
     import io as _stdio  # module-level `io` is comfy_api.latest.io
     exe = _cli_exe("grok", [r"D:\CLI-Data\.grok\bin\grok.exe"])
-    system, text, images = _cli_split_messages(messages)
+    system, texts, pictures = _cli_parts(messages)
+    text = "\n\n".join(t for t in texts if t)
+    images = [b for _, b in pictures]
     env = {k: v for k, v in os.environ.items() if k not in ("XAI_API_KEY", "GROK_API_KEY")}
     with _cli_workdir() as wd:
         base = [exe, "-m", model, "--output-format", "json", "--tools", "", "--max-turns", "1",
@@ -1998,12 +2069,15 @@ def _send_grok_cli(model: str, messages: list[dict], timeout: float, reasoning_e
             # --prompt-file takes the JSON content blocks too (TESTED 2026-11-16 on
             # grok 1.0.77: a solid red and a solid blue image were both named), so
             # images no longer compete with the text for the command line.
+            # A labelled image gets its label as a text block right before it.
             blocks = [{"type": "text", "text": body}]
-            for b in images:
+            for label, b in pictures:
                 im = _Image.open(_stdio.BytesIO(_b64.b64decode(b))).convert("RGB")
                 im.thumbnail((_GROK_IMAGE_SIDE, _GROK_IMAGE_SIDE))
                 buf = _stdio.BytesIO()
                 im.save(buf, "JPEG", quality=85)
+                if label:
+                    blocks.append({"type": "text", "text": label})
                 blocks.append({"type": "image", "data": _b64.b64encode(buf.getvalue()).decode(),
                                "mimeType": "image/jpeg"})
             pf = Path(wd) / "prompt.json"
@@ -2036,7 +2110,8 @@ def _send_agy_cli(model: str, messages: list[dict], timeout: float, reasoning_ef
     prompt.md, looks at the images and listens to the audio in its folder, in plan mode."""
     import base64 as _b64
     exe = _cli_exe("agy", [r"D:\CLI-Data\agy\agy.exe"])
-    system, text, images = _cli_split_messages(messages)
+    system, texts, pictures = _cli_parts(messages)
+    text = "\n\n".join(t for t in texts if t)
     # The level rides in the model name: gemini-3.8-flash-low / -medium / -high.
     # 3.1 Pro has only low and high.
     effort = {"none": "low", "low": "low", "medium": "medium", "high": "high",
@@ -2046,10 +2121,11 @@ def _send_agy_cli(model: str, messages: list[dict], timeout: float, reasoning_ef
         effort = "high"
     slug = f"{base}-{effort}"
     with _cli_workdir() as wd:
+        # The files sit apart from the text, so a labelled image is named with its label.
         names = []
-        for i, b in enumerate(images):
+        for i, (label, b) in enumerate(pictures):
             (Path(wd) / f"image_{i:02d}.png").write_bytes(_b64.b64decode(b))
-            names.append(f"image_{i:02d}.png")
+            names.append(f"image_{i:02d}.png = {label}" if label else f"image_{i:02d}.png")
         for i, (data, ext) in enumerate(audio or []):
             (Path(wd) / f"audio_{i:02d}.{ext}").write_bytes(data)
             names.append(f"audio_{i:02d}.{ext}")
@@ -2099,9 +2175,13 @@ def _send_lmstudio(base_url: str, api_key: str | None, model: str, messages: lis
         _lmstudio_request(base_url, "/api/v1/models", api_key)  # raises the plain "not running" error
     loaded = bool(info and info.get("loaded_instances"))
 
-    system, text, images = _cli_split_messages(messages)
+    system, texts, pictures = _cli_parts(messages)
+    text = "\n\n".join(t for t in texts if t)
     content = [{"type": "text", "content": text or "Describe a scene vividly."}]
-    content += [{"type": "image", "data_url": f"data:image/png;base64,{b}"} for b in images]
+    for label, b in pictures:  # a labelled image right after its own label
+        if label:
+            content.append({"type": "text", "content": label})
+        content.append({"type": "image", "data_url": f"data:image/png;base64,{b}"})
     body: dict[str, Any] = {"model": model, "input": content, "store": False,
                             "max_output_tokens": int(sampling.get("max_tokens") or 4096)}
     if system:
@@ -2258,6 +2338,7 @@ def write_prompt_api(
     unload_after_run: bool = True,
     audio=None,
     asset_brief: str = "",
+    labelled_images: list[tuple[str, str]] | None = None,
 ) -> tuple[str, str, str]:
     """The Luna-LLMPromptAPI writer: build the messages, call the provider, clean and split.
 
@@ -2274,7 +2355,9 @@ def write_prompt_api(
     "custom" (the default here, so luna_writer_api callers are unchanged) keeps them.
     Figures of the run land in _run_stats() for the node face. min_p, repeat_penalty,
     context_length and unload_after_run are LM Studio's. audio: a ComfyUI AUDIO dict, for the
-    routes in AUDIO_PROTOCOLS only.
+    routes in AUDIO_PROTOCOLS only. labelled_images: (label, base64 PNG) pairs (the node's
+    `refs` pictures), sent after images_b64, each right after its label where the route
+    allows text between images, else with the labels listed in attach order.
     """
     cfg, native_video = _video_route(provider, model_name, video, video_input_mode)
     if video is not None and not native_video:
@@ -2461,6 +2544,7 @@ def write_prompt_api(
     # Vision content: base64 PNGs, already encoded by the caller. Empty
     # entries are dropped, as the node always did.
     images_b64 = [b for b in (images_b64 or []) if b]
+    labelled = [(label, b) for label, b in (labelled_images or []) if b]
     media_log = ""
     if native_video:
         media_log = f"Video: native Gemini clip with embedded audio if present; sampling {gemini_video_fps:g} fps."
@@ -2470,8 +2554,8 @@ def write_prompt_api(
     if sys_prompt:
         messages.append({"role": "system", "content": sys_prompt})
 
-    if images_b64:
-        user_content = _build_multimodal_user_content(final_user_prompt, images_b64)
+    if images_b64 or labelled:
+        user_content = _build_multimodal_user_content(final_user_prompt, images_b64, labelled)
         messages.append({"role": "user", "content": user_content})
     else:
         messages.append({"role": "user", "content": final_user_prompt})
@@ -2755,6 +2839,13 @@ class LLMPromptAPINode(io.ComfyNode):
                                         "<Picture N> with its true size and ratio. Sent as a PICTURES block, so the "
                                         "model knows which picture is which and each one's real shape even when the "
                                         "image batch is letterboxed."),
+                # Added last (S7): a socket-only input, so saved widget positions are unchanged.
+                io.Custom("LUNA_H3_REFS").Input(
+                    "refs", optional=True,
+                    tooltip="Pictures to look at, each at its own size: wire Luna-ImageLoader `refs` or "
+                            "Luna-H3-AssetLoader `refs`. Each is sent after the image and video media as "
+                            "'Image N (role, WxH)' then the picture; vision_mp is the only shrink. Without a "
+                            "wired asset_brief, the brief in refs becomes the PICTURES block."),
             ],
             outputs=[
                 io.String.Output("positive", display_name="positive"),
@@ -2821,6 +2912,7 @@ class LLMPromptAPINode(io.ComfyNode):
         unload_after_run: bool = True,
         audio=None,
         asset_brief: str = "",
+        refs=None,
     ):
         # Provider and video-mode errors first, as before the writer core existed.
         _cfg, native_video = _video_route(provider, model_name, video, video_input_mode)
@@ -2842,6 +2934,7 @@ class LLMPromptAPINode(io.ComfyNode):
                 img = _tensor_to_base64_png(image[i], max_mp=vision_mp)
                 if img:
                     images_b64.append(img)
+        n_image = len(images_b64)
         sampled_log = ""
         if video is not None and not native_video:
             if not 1 <= int(video_sample_frames) <= 256:
@@ -2853,6 +2946,16 @@ class LLMPromptAPINode(io.ComfyNode):
                 img = _tensor_to_base64_png(frame, max_mp=vision_mp)
                 if img:
                     images_b64.append(img)
+
+        # The pictures in `refs`: each at its own shape (vision_mp is the only shrink),
+        # with its "Image N (...)" label; write_prompt_api sends them after the media above.
+        labelled_images = [(label, _tensor_to_base64_png(frame, max_mp=vision_mp))
+                           for label, frame in _refs_pictures(refs)]
+        labelled_images = [(label, b) for label, b in labelled_images if b]
+        pictures_log = ""
+        if labelled_images:
+            pictures_log = _pictures_log([("image", n_image), ("video", len(images_b64) - n_image),
+                                          ("refs", len(labelled_images))])
 
         positive, negative, log = write_prompt_api(
             provider=provider, model_name=model_name, system_prompt=system_prompt,
@@ -2870,13 +2973,15 @@ class LLMPromptAPINode(io.ComfyNode):
             video_sample_frames=video_sample_frames, gemini_video_fps=gemini_video_fps,
             quality=quality, min_p=min_p, repeat_penalty=repeat_penalty,
             context_length=context_length, unload_after_run=unload_after_run, audio=audio,
-            asset_brief=asset_brief,
+            asset_brief=_refs_brief(asset_brief, refs), labelled_images=labelled_images,
         )
-        # Sampled frames are this node's work, so their log line is added here,
-        # ahead of the validation report, as before.
-        if sampled_log:
-            print(f"[Luna-LLMPromptAPI] {sampled_log}")
-            log = "\n".join(part for part in (sampled_log, log) if part)
+        # Sampled frames and refs pictures are this node's work, so their log lines are
+        # added here, ahead of the validation report, as before.
+        head = [line for line in (pictures_log, sampled_log) if line]
+        for line in head:
+            print(f"[Luna-LLMPromptAPI] {line}")
+        if head:
+            log = "\n".join(head + ([log] if log else []))
 
         # The node face reads these in onExecuted: the last-run line and its
         # "view thinking" link.

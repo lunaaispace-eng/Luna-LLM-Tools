@@ -225,6 +225,8 @@ Optional inputs:
 | `video` | Frame batch input. |
 | `audio` | Audio input for compatible Gemma-style models. |
 | `frames` | The clip's real frame count, used by `validate = h3`. |
+| `asset_brief` | The picture inventory from Luna-H3-AssetLoader or Luna-ImageLoader, sent as a `PICTURES` block. |
+| `refs` | Pictures from Luna-ImageLoader or Luna-H3-AssetLoader `refs`, each sent at its own shape after the label `Image N (role, WxH)`; `vision_mp` is the only shrink. Without a wired `asset_brief`, the brief inside `refs` becomes the `PICTURES` block. |
 
 Outputs:
 
@@ -337,8 +339,9 @@ gemini_video_fps
 min_p, repeat_penalty, context_length, unload_after_run   (LM Studio)
 ```
 
-Optional inputs: `style`, `context`, `width` / `height`, `image`, `video`, `audio`, `frames` (same
-meaning as on the local node).
+Optional inputs: `style`, `context`, `width` / `height`, `image`, `video`, `audio`, `frames`, `asset_brief`, `refs` (same
+meaning as on the local node). Every provider gets the `refs` labels: next to each picture where it takes text and
+pictures in turn, as an attach-order list on Codex, and in the file names on Antigravity.
 
 `gemini_thinking_level` applies to every Gemini 3 model. `gemini_thinking_budget` only applied to Gemini 2.5,
 which no longer answers new users; it stays in saved workflows and is not shown.
@@ -509,7 +512,7 @@ Preset files live in:
 prompts/*.md
 ```
 
-Current library size: 37 Markdown presets.
+Current library size: 25 Markdown presets.
 
 Each file can include YAML frontmatter:
 

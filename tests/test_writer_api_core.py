@@ -339,7 +339,8 @@ class WriterApiCoreTest(unittest.TestCase):
             "gemini_thinking_level", "enable_caching", "disable_thinking", "timeout_seconds",
             "auto_settings", "reasoning_effort", "server_url", "validate", "frames", "video",
             "video_input_mode", "video_sample_frames", "gemini_video_fps", "quality",
-            "min_p", "repeat_penalty", "context_length", "unload_after_run", "audio", "asset_brief"])
+            "min_p", "repeat_penalty", "context_length", "unload_after_run", "audio", "asset_brief",
+            "labelled_images"])
         self.assertTrue(all(p.kind is inspect.Parameter.KEYWORD_ONLY for p in params.values()))
         schema = self._schema()
         widgets = {i.id: getattr(i, "default", None) for i in schema.inputs}
@@ -364,7 +365,116 @@ class WriterApiCoreTest(unittest.TestCase):
             "disable_thinking", "timeout_seconds", "vision_mp", "validate", "auto_settings",
             "reasoning_effort", "style", "context", "width", "height", "image", "video", "audio",
             "frames", "video_input_mode", "video_sample_frames", "gemini_video_fps", "quality",
-            "min_p", "repeat_penalty", "context_length", "unload_after_run", "asset_brief"])
+            "min_p", "repeat_penalty", "context_length", "unload_after_run", "asset_brief", "refs"])
+        refs = schema.inputs[-1]
+        self.assertTrue(refs.optional)
+        self.assertEqual(refs.get_io_type(), "LUNA_H3_REFS")
+
+    # ---- refs input (LUNA_H3_REFS) ------------------------------------------------------
+
+    def _refs(self, roles=True):
+        import torch
+        refs = {"images": [torch.rand(1, 6, 10, 3), torch.rand(2, 12, 8, 3)],
+                "brief": "Image 1 (edit base, 10x6) · Image 2 (reference, 8x12)"}
+        if roles:
+            refs["roles"] = ["edit base", "reference"]
+        return refs
+
+    @staticmethod
+    def _png_size(b64):
+        from PIL import Image
+        return Image.open(io.BytesIO(base64.b64decode(b64))).size
+
+    def test_refs_labels_and_order_openai(self):
+        out, rec = self._execute(image=_image(), refs=self._refs())
+        content = rec.messages()[1]["content"]
+        self.assertEqual([c["type"] for c in content],
+                         ["text", "image_url", "text", "image_url", "text", "image_url"])
+        self.assertEqual(content[2]["text"], "Image 1 (edit base, 10x6)")
+        self.assertEqual(content[4]["text"], "Image 2 (reference, 8x12)")
+        sizes = [self._png_size(c["image_url"]["url"].split(",", 1)[1]) for c in content[3::2]]
+        self.assertEqual(sizes, [(10, 6), (8, 12)])  # each at its own size, first frame only
+        self.assertEqual(out.args[2], "Pictures: 1 from image, 2 from refs.")
+
+    def test_refs_labels_without_roles(self):
+        _, rec = self._execute(refs=self._refs(roles=False))
+        content = rec.messages()[1]["content"]
+        self.assertEqual([c["text"] for c in content if c["type"] == "text"][1:],
+                         ["Image 1 (10x6)", "Image 2 (8x12)"])
+
+    def test_refs_vision_mp_keeps_aspect(self):
+        import torch
+        _, rec = self._execute(refs={"images": [torch.rand(1, 200, 400, 3), torch.rand(1, 300, 100, 3)]},
+                               vision_mp=0.005)
+        content = rec.messages()[1]["content"]
+        for c, ratio in ((content[2], 2.0), (content[4], 1 / 3)):
+            w, h = self._png_size(c["image_url"]["url"].split(",", 1)[1])
+            self.assertLessEqual(w * h, 5000)
+            self.assertAlmostEqual(w / h, ratio, delta=0.05)
+
+    def test_refs_brief_precedence(self):
+        _, rec = self._execute(refs={"images": [], "brief": "Image 1 (edit base, 1920x1080)"})
+        self.assertEqual(rec.messages()[1]["content"],
+                         "PICTURES:\nImage 1 (edit base, 1920x1080)\n\nUSER REQUEST:\na red fox in snow")
+        _, rec = self._execute(refs={"images": [], "brief": "from refs"}, asset_brief="from the wire")
+        self.assertEqual(rec.messages()[1]["content"], "PICTURES:\nfrom the wire\n\nUSER REQUEST:\na red fox in snow")
+
+    def test_refs_reach_gemini_interleaved(self):
+        _, rec = self._execute(provider="Gemini", model_name="gemini-3.6-flash", refs=self._refs())
+        content = rec.messages()[1]["content"]
+        self.assertEqual([c["type"] for c in content], ["text", "text", "image_url", "text", "image_url"])
+        self.assertEqual(content[1]["text"], "Image 1 (edit base, 10x6)")
+
+    def test_cli_parts_pair_labels_with_images(self):
+        content = self.mod._build_multimodal_user_content("REQUEST", ["AAA"], [("Image 1 (edit base, 10x6)", "BBB"),
+                                                                             ("Image 2 (8x12)", "CCC")])
+        msgs = [{"role": "system", "content": "SYS"}, {"role": "user", "content": content}]
+        system, texts, images = self.mod._cli_parts(msgs)
+        self.assertEqual((system, texts), ("SYS", ["REQUEST"]))
+        self.assertEqual(images, [("", "AAA"), ("Image 1 (edit base, 10x6)", "BBB"), ("Image 2 (8x12)", "CCC")])
+        # Codex attaches files apart from the text: the labels follow in attach order.
+        system, text, b64s = self.mod._cli_split_messages(msgs)
+        self.assertEqual(b64s, ["AAA", "BBB", "CCC"])
+        self.assertEqual(text, "REQUEST\n\nIMAGES, in the order attached:\n1. an image from the image or video "
+                               "input\n2. Image 1 (edit base, 10x6)\n3. Image 2 (8x12)")
+        # No labels: the old split, unchanged.
+        plain = [{"role": "user", "content": self.mod._build_multimodal_user_content("REQUEST", ["AAA"])}]
+        self.assertEqual(self.mod._cli_split_messages(plain), ("", "REQUEST", ["AAA"]))
+
+    def test_cli_senders_interleave_labels(self):
+        png = self.mod._tensor_to_base64_png(_image()[0])
+        content = self.mod._build_multimodal_user_content("REQUEST", [], [("Image 1 (edit base, 10x6)", png)])
+        msgs = [{"role": "user", "content": content}]
+        seen = {}
+
+        class _Done(Exception):
+            pass
+
+        def fake_run(cmd, *, input_text, cwd, timeout, env=None):
+            seen["input"] = input_text
+            import pathlib
+            for name in ("prompt.json", "prompt.md"):
+                p = pathlib.Path(cwd) / name
+                if p.is_file():
+                    seen[name] = p.read_text(encoding="utf-8")
+            raise _Done()
+        import tempfile
+        with mock.patch.object(self.mod, "_cli_run", fake_run), \
+             mock.patch.object(self.mod, "_cli_exe", lambda *a: "x"), \
+             mock.patch.object(self.mod, "_cli_workdir", lambda: tempfile.TemporaryDirectory()):
+            with self.assertRaises(_Done):
+                self.mod._send_claude_cli("m", msgs, 10.0, "low")
+            blocks = json.loads(seen["input"])["message"]["content"]
+            self.assertEqual([b["type"] for b in blocks], ["text", "text", "image"])
+            self.assertEqual(blocks[1]["text"], "Image 1 (edit base, 10x6)")
+            with self.assertRaises(_Done):
+                self.mod._send_agy_cli("gemini-3.8-flash", msgs, 10.0, "low")
+            self.assertIn("image_00.png = Image 1 (edit base, 10x6)", seen["prompt.md"])
+            with self.assertRaises(_Done):
+                self.mod._send_grok_cli("grok-4.7", msgs, 10.0, "low")
+            blocks = json.loads(seen["prompt.json"])
+            self.assertEqual([b["type"] for b in blocks], ["text", "text", "image"])
+            self.assertEqual(blocks[1]["text"], "Image 1 (edit base, 10x6)")
 
 
 if __name__ == "__main__":

@@ -142,6 +142,78 @@ class GGUFWriterCoreTest(unittest.TestCase):
         self.assertNotIn("unknown_extra", seen)
         self.assertNotIn("media_override", seen)
 
+    # ---- refs input (LUNA_H3_REFS) ------------------------------------------------------
+
+    def _jpeg_size(self, part):
+        from PIL import Image
+        raw = base64.b64decode(part["image_url"]["url"].split(",", 1)[1])
+        return Image.open(io.BytesIO(raw)).size
+
+    def test_refs_labels_with_roles(self):
+        refs = {"images": [_tensor(6, 10), _tensor(12, 8, n=2)], "roles": ["edit base", "reference"]}
+        _, rec = self._generate(refs=refs)
+        media = rec["invoke"]["media_content"]
+        self.assertEqual([m["type"] for m in media], ["text", "image_url", "text", "image_url"])
+        self.assertEqual(media[0]["text"], "Image 1 (edit base, 10x6)")
+        self.assertEqual(media[2]["text"], "Image 2 (reference, 8x12)")
+        self.assertTrue(rec["load"]["want_vision"])
+
+    def test_refs_labels_without_roles(self):
+        _, rec = self._generate(refs={"images": [_tensor(6, 10), _tensor(12, 8)]})
+        media = rec["invoke"]["media_content"]
+        self.assertEqual(media[0]["text"], "Image 1 (10x6)")
+        self.assertEqual(media[2]["text"], "Image 2 (8x12)")
+
+    def test_refs_mixed_sizes_sent_at_own_size_first_frame_only(self):
+        a, b = _tensor(30, 50), _tensor(40, 20, n=3)
+        _, rec = self._generate(refs={"images": [a, b]}, vision_mp=0.0)
+        media = rec["invoke"]["media_content"]
+        self.assertEqual(len(media), 4)  # one frame of the batch, not three
+        self.assertEqual(self._jpeg_size(media[1]), (50, 30))
+        self.assertEqual(self._jpeg_size(media[3]), (20, 40))
+        self.assertEqual(media[3]["image_url"]["url"], self._reference_jpeg_url(b[0]))
+
+    def test_refs_vision_mp_keeps_aspect(self):
+        _, rec = self._generate(refs={"images": [_tensor(200, 400), _tensor(300, 100)]}, vision_mp=0.005)
+        media = rec["invoke"]["media_content"]
+        for part, ratio in ((media[1], 2.0), (media[3], 1 / 3)):
+            w, h = self._jpeg_size(part)
+            self.assertLessEqual(w * h, 5000)
+            self.assertAlmostEqual(w / h, ratio, delta=0.05)
+
+    def test_refs_after_image_and_reference_and_logged(self):
+        img, ref = _tensor(), _tensor(6, 10)
+        out, rec = self._generate(image=img, reference_image=ref, refs={"images": [_tensor(4, 4)]})
+        media = rec["invoke"]["media_content"]
+        self.assertEqual([m.get("text") for m in media if m["type"] == "text"],
+                         ["Input Image:", "Reference Image:", "Image 1 (4x4)"])
+        self.assertEqual(media[-1]["image_url"]["url"], self._reference_jpeg_url(_tensor(4, 4)[0]))
+        self.assertEqual(out[2], "Pictures: 1 from image, 1 from reference_image, 1 from refs.")
+
+    def test_refs_empty_or_missing_images_skipped(self):
+        import torch
+        _, rec = self._generate(refs={"images": [None, torch.zeros(0, 4, 4, 3), _tensor(4, 6)]})
+        media = rec["invoke"]["media_content"]
+        self.assertEqual([m["text"] for m in media if m["type"] == "text"], ["Image 3 (6x4)"])
+        _, rec = self._generate(refs={"videos": []})
+        self.assertEqual(rec["invoke"]["media_content"], [])
+        self.assertFalse(rec["load"]["want_vision"])
+
+    def test_refs_brief_is_the_pictures_block_unless_asset_brief(self):
+        refs = {"images": [], "brief": "Image 1 (edit base, 1920x1080)"}
+        _, rec = self._generate(refs=refs)
+        self.assertEqual(rec["invoke"]["user_prompt"],
+                         "PICTURES:\nImage 1 (edit base, 1920x1080)\n\nUSER PROMPT:\na red fox in snow")
+        _, rec = self._generate(refs=refs, asset_brief="<Picture 1> = 1920x1080 (16:9, landscape)")
+        self.assertEqual(rec["invoke"]["user_prompt"],
+                         "PICTURES:\n<Picture 1> = 1920x1080 (16:9, landscape)\n\nUSER PROMPT:\na red fox in snow")
+
+    def test_refs_is_last_input(self):
+        inputs = self.mod.LLMPromptNode.define_schema().inputs
+        self.assertEqual([i.id for i in inputs][-2:], ["asset_brief", "refs"])
+        self.assertTrue(inputs[-1].optional)
+        self.assertEqual(inputs[-1].get_io_type(), "LUNA_H3_REFS")
+
     # ---- Writer hooks ---------------------------------------------------------------
 
     def test_media_override_used(self):
