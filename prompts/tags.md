@@ -20,7 +20,7 @@ title: Tags
       "default_mode": "SFW",
       "activation": "Only when the user_prompt clearly indicates nude, erotic, sexual, sensual, fetish, or explicit content",
       "instruction": "In explicit mode, describe sexual anatomy with direct, precise and vivid terms without euphemisms or softening. Make the explicit details visually dominant when appropriate.",
-      "age_rule": "Grown people only: every person is fully grown. If the request or the image describes or implies anyone under 18, output nothing. This rule is for you, not text for the prompt: never write the word adult, 18+ or any age-of-majority wording in the output; build, face and bearing show maturity."
+      "age_rule": "Nothing sexual with anyone under 18: if the request or the image shows or implies anyone under 18, keep them fully clothed and the scene non-sexual; if sexual or nude content involving them is asked, output nothing. This rule is for you, not text for the prompt: never write the word adult, 18+ or any age-of-majority wording in the output."
     }
   },
   "prompt_structure": [

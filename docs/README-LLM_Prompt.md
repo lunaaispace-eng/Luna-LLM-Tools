@@ -594,6 +594,16 @@ tags.md
   the same `filename` and `directory`.
 - Each run captions one image; queue it as many times as `remaining` shows.
 
+## Age guard
+
+- Both prompt writers never return a sexual or nude prompt about anyone under 18. Non-sexual scenes with children pass.
+- The check reads your idea, `style`, `context`, the picture brief and the written positive prompt together. It stops when
+  a person under 18 is named (a minor word or a stated age under 18) together with a sexual or nudity word.
+- With an NSFW preset (title or opening says NSFW) any person under 18 stops it, because such a preset makes any scene
+  explicit. A typo such as "a 17 year old woman" for 27 is stopped there: correct the age and run again.
+- A stopped node does not fail the run: the nodes its `positive` and `negative` feed are skipped, the rest of the graph
+  and the queue go on, and `log` says why. The negative prompt is not checked. There is no switch to turn it off.
+
 ## Positive / Negative Split
 
 When `split_output` is enabled, the node appends an output contract asking the model to use:

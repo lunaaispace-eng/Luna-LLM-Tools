@@ -48,6 +48,7 @@ import folder_paths
 from comfy_api.latest import io
 
 # Bundled output cleaner â€” no external dependencies
+from . import age_guard
 from .output_cleaner import (
     OutputCleanConfig, clean_model_output, normalize_prompt_separator, split_positive_negative, strip_code_fence_lines,
     negative_dropped, NEGATIVE_DROPPED_NOTE,
@@ -2072,6 +2073,7 @@ class _LLMRunner:
     # Main entry point
     # ------------------------------------------------------------------
 
+    @age_guard.guard_writer
     def generate(
         self,
         model_name: str,
@@ -2624,7 +2626,11 @@ class LLMPromptNode(io.ComfyNode):
         # Drop any framework-injected extras the runner doesn't expect, then run.
         call_kwargs = _filter_kwargs_for_callable(_LLMRunner.generate, kwargs)
         with _RUNNER_LOCK:
-            positive, negative, log = _RUNNER.generate(**call_kwargs)
+            try:
+                positive, negative, log = _RUNNER.generate(**call_kwargs)
+            except age_guard.AgeGuardError as exc:
+                # Skip only what this prompt feeds; the rest of the graph and the queue run on.
+                return io.NodeOutput(*age_guard.blocked_outputs(str(exc)))
             stats = dict(getattr(_RUNNER, "last_stats", {}) or {})
             reasoning = getattr(_RUNNER, "last_reasoning", "") or ""
         # The node face reads these in onExecuted: the last-run line and its

@@ -43,6 +43,7 @@ from .llm_prompt_node import (
     _refs_brief,
     _pictures_log,
 )
+from . import age_guard
 from .output_cleaner import (OutputCleanConfig, clean_model_output, normalize_prompt_separator, split_positive_negative,
                              negative_dropped, NEGATIVE_DROPPED_NOTE)
 from .h3_validate import validate_h3, format_log
@@ -2295,6 +2296,7 @@ def _video_route(provider: str, model_name: str, video, video_input_mode: str) -
     return cfg, native_video
 
 
+@age_guard.guard_writer
 def write_prompt_api(
     *,
     provider: str,
@@ -2957,24 +2959,28 @@ class LLMPromptAPINode(io.ComfyNode):
             pictures_log = _pictures_log([("image", n_image), ("video", len(images_b64) - n_image),
                                           ("refs", len(labelled_images))])
 
-        positive, negative, log = write_prompt_api(
-            provider=provider, model_name=model_name, system_prompt=system_prompt,
-            custom_system_prompt=custom_system_prompt, user_prompt=user_prompt,
-            context=context, style=style, width=eff_w, height=eff_h, images_b64=images_b64,
-            output_format=output_format, split_output=split_output, max_tokens=max_tokens,
-            temperature=temperature, top_p=top_p, top_k=top_k,
-            presence_penalty=presence_penalty, frequency_penalty=frequency_penalty, seed=seed,
-            stop_sequences=stop_sequences, gemini_thinking_budget=gemini_thinking_budget,
-            gemini_thinking_level=gemini_thinking_level, enable_caching=enable_caching,
-            disable_thinking=disable_thinking, timeout_seconds=timeout_seconds,
-            auto_settings=auto_settings, reasoning_effort=reasoning_effort,
-            server_url=server_url, validate=validate, frames=frames,
-            video=video if native_video else None, video_input_mode=video_input_mode,
-            video_sample_frames=video_sample_frames, gemini_video_fps=gemini_video_fps,
-            quality=quality, min_p=min_p, repeat_penalty=repeat_penalty,
-            context_length=context_length, unload_after_run=unload_after_run, audio=audio,
-            asset_brief=_refs_brief(asset_brief, refs), labelled_images=labelled_images,
-        )
+        try:
+            positive, negative, log = write_prompt_api(
+                provider=provider, model_name=model_name, system_prompt=system_prompt,
+                custom_system_prompt=custom_system_prompt, user_prompt=user_prompt,
+                context=context, style=style, width=eff_w, height=eff_h, images_b64=images_b64,
+                output_format=output_format, split_output=split_output, max_tokens=max_tokens,
+                temperature=temperature, top_p=top_p, top_k=top_k,
+                presence_penalty=presence_penalty, frequency_penalty=frequency_penalty, seed=seed,
+                stop_sequences=stop_sequences, gemini_thinking_budget=gemini_thinking_budget,
+                gemini_thinking_level=gemini_thinking_level, enable_caching=enable_caching,
+                disable_thinking=disable_thinking, timeout_seconds=timeout_seconds,
+                auto_settings=auto_settings, reasoning_effort=reasoning_effort,
+                server_url=server_url, validate=validate, frames=frames,
+                video=video if native_video else None, video_input_mode=video_input_mode,
+                video_sample_frames=video_sample_frames, gemini_video_fps=gemini_video_fps,
+                quality=quality, min_p=min_p, repeat_penalty=repeat_penalty,
+                context_length=context_length, unload_after_run=unload_after_run, audio=audio,
+                asset_brief=_refs_brief(asset_brief, refs), labelled_images=labelled_images,
+            )
+        except age_guard.AgeGuardError as exc:
+            # Skip only what this prompt feeds; the rest of the graph and the queue run on.
+            return io.NodeOutput(*age_guard.blocked_outputs(str(exc)))
         # Sampled frames and refs pictures are this node's work, so their log lines are
         # added here, ahead of the validation report, as before.
         head = [line for line in (pictures_log, sampled_log) if line]
