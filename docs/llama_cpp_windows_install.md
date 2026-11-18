@@ -2,7 +2,9 @@
 
 This guide is for users who want to run the local `Luna-LLMPrompt` node with GGUF models on Windows.
 
-The difficult part is not the node itself. The difficult part is choosing a `llama-cpp-python` wheel that matches the user's ComfyUI Python and CUDA stack. Installing the wrong wheel can make the local GGUF node fail to import, run on CPU, or crash when a model loads.
+- The difficult part is not the node itself.
+- The difficult part is choosing a `llama-cpp-python` wheel that matches the user's ComfyUI Python and CUDA stack.
+- Installing the wrong wheel can make the local GGUF node fail to import, run on CPU, or crash when a model loads.
 
 This node is tested with JamePeng's `llama-cpp-python` builds because those builds include handler support used by modern Gemma and Qwen GGUF models.
 
@@ -14,7 +16,9 @@ This repository includes a helper script:
 tools/llama_cpp_windows_doctor.py
 ```
 
-Default mode is read-only. It inspects the selected ComfyUI Python, checks Python ABI, Torch CUDA, the existing `llama-cpp-python` install, queries JamePeng GitHub releases, and recommends the matching wheel.
+- Default mode is read-only.
+- It inspects the selected ComfyUI Python, checks Python ABI, Torch CUDA, the existing `llama-cpp-python` install,
+  queries JamePeng GitHub releases, and recommends the matching wheel.
 
 Run it from the node folder:
 
@@ -59,7 +63,9 @@ The wheel must match:
 | CUDA build family | CUDA 12.8 / 13.0, etc. | `cu128`, `cu130`, etc. |
 | llama-cpp-python version | `0.4.7` (0.3.48+ for MTP, 0.4.x for Gemma 4 drafters, 0.4.7 for llama.cpp 1.0 features such as the MoE cache CPU share) | `llama_cpp_python-0.4.7...whl` |
 
-Use the CUDA version reported by PyTorch inside ComfyUI as the main CUDA selector. The CUDA version shown by `nvidia-smi` is the driver runtime capability; it does not always equal the PyTorch wheel CUDA build.
+- Use the CUDA version reported by PyTorch inside ComfyUI as the main CUDA selector.
+- The CUDA version shown by `nvidia-smi` is the driver runtime capability; it does not always equal the PyTorch wheel
+  CUDA build.
 
 ## Step 1: Find ComfyUI Python
 
@@ -181,11 +187,14 @@ Example URL:
 https://github.com/JamePeng/llama-cpp-python/releases/download/v0.4.7-cu130-win-20261113/llama_cpp_python-0.4.7+cu130-cp312-cp312-win_amd64.whl
 ```
 
-Installed on `E:\ComfyUI-Easy-Install` on 2026-11-15 (was 0.4.2+cu130). JamePeng 0.4.7 tracks llama.cpp v1.0.0 without its two
-API-pruning commits. The previous wheel, to roll back:
-`https://github.com/JamePeng/llama-cpp-python/releases/download/v0.4.2-cu130-win-20261003/llama_cpp_python-0.4.2+cu130-cp312-cp312-win_amd64.whl`
+- Installed on the reference ComfyUI Easy-Install on 2026-11-15 (was 0.4.2+cu130).
+- JamePeng 0.4.7 tracks llama.cpp v1.0.0 without its two API-pruning commits.
+- The previous wheel, to roll back:
+  `https://github.com/JamePeng/llama-cpp-python/releases/download/v0.4.2-cu130-win-20261003/llama_cpp_python-0.4.2+cu130-cp312-cp312-win_amd64.whl`
 
-Do not install a `cp311` wheel into Python 3.12. Do not install a `cu128` wheel just because another user used it. Match your own ComfyUI Python and Torch CUDA.
+- Do not install a `cp311` wheel into Python 3.12.
+- Do not install a `cu128` wheel just because another user used it.
+- Match your own ComfyUI Python and Torch CUDA.
 
 ## Step 6: Install the Wheel
 
@@ -199,7 +208,9 @@ $wheel = 'https://github.com/JamePeng/llama-cpp-python/releases/download/v0.4.7-
 & $py -m pip install --no-cache-dir --force-reinstall --no-deps $wheel
 ```
 
-Keep `--no-deps`. ComfyUI already has a carefully matched Python stack. Letting pip replace dependencies can break Torch, NumPy, or other custom nodes.
+- Keep `--no-deps`.
+- ComfyUI already has a carefully matched Python stack.
+- Letting pip replace dependencies can break Torch, NumPy, or other custom nodes.
 
 ## Step 7: Verify Import
 
@@ -211,16 +222,17 @@ A healthy install prints the version and a `llama.dll` path from the ComfyUI Pyt
 
 ## Step 8: Verify the CUDA Backend Loads
 
-Since 0.4.x the wheel loads its backends (`ggml-cuda.dll`, `ggml-cpu-*.dll`) at run time from `llama_cpp\lib`.
-`ggml-cuda.dll` needs the CUDA runtime DLLs that ship in `torch\lib`, so import torch first, as ComfyUI does:
+- Since 0.4.x the wheel loads its backends (`ggml-cuda.dll`, `ggml-cpu-*.dll`) at run time from `llama_cpp\lib`.
+- `ggml-cuda.dll` needs the CUDA runtime DLLs that ship in `torch\lib`, so import torch first, as ComfyUI does:
 
 ```powershell
 & $py -c "import torch, os, llama_cpp, llama_cpp._ggml as g; d=os.path.join(os.path.dirname(llama_cpp.__file__),'lib'); g.ggml_backend_load_all_from_path(d.encode()); [print(g.ggml_backend_dev_name(g.ggml_backend_dev_get(i)), g.ggml_backend_dev_description(g.ggml_backend_dev_get(i))) for i in range(g.ggml_backend_dev_count())]"
 ```
 
-A healthy CUDA install lists `CUDA0` with the GPU name, then `CPU`. Without `import torch` only `CPU` is listed, because
-`ggml-cuda.dll` cannot find the CUDA runtime; that is not a broken install (TESTED 2026-11-15, 0.4.7+cu130, RTX 4090).
-`llama_supports_gpu_offload()` is not a CUDA check: it also returns True when only the RPC backend is loaded.
+- A healthy CUDA install lists `CUDA0` with the GPU name, then `CPU`.
+- Without `import torch` only `CPU` is listed, because `ggml-cuda.dll` cannot find the CUDA runtime; that is not a
+  broken install (TESTED 2026-11-15, 0.4.7+cu130, RTX 4090).
+- `llama_supports_gpu_offload()` is not a CUDA check: it also returns True when only the RPC backend is loaded.
 
 ## Step 9: Optional GGUF Smoke Test
 
@@ -236,7 +248,8 @@ If the wheel is wrong, this is where failures usually become obvious.
 
 ## MoE Models: Experts in RAM and the Expert Cache
 
-0.4.7+ only. Luna-LLMPrompt's gear panel › "MoE models" has three settings, off by default:
+- 0.4.7+ only.
+- Luna-LLMPrompt's gear panel › "MoE models" has three settings, off by default:
 
 | Setting | Meaning |
 | --- | --- |
@@ -244,12 +257,16 @@ If the wheel is wrong, this is where failures usually become obvious.
 | `moe_cache_mib` | GPU cache for the most used experts; only with experts in RAM |
 | `moe_cache_cpu_share` | share of cache misses the CPU computes instead of uploading them, once the cache is full |
 
-They matter only for MoE models (names with `A3B`, `A4B`). Dense models ignore them. To see which of your models
-are MoE (and which have MTP layers), read their headers: `& $py tools\gguf_inventory.py <your GGUF folder>`. If the model fits in VRAM, leave
-them off: all on the GPU is fastest. Use them when a video model needs the VRAM.
+- They matter only for MoE models (names with `A3B`, `A4B`).
+- Dense models ignore them.
+- To see which of your models are MoE (and which have MTP layers), read their headers: `& $py tools\gguf_inventory.py <your GGUF folder>`.
+- If the model fits in VRAM, leave them off: all on the GPU is fastest.
+- Use them when a video model needs the VRAM.
 
-Measured with llama.cpp's `scripts/moe-cache-tune.py` (v1.0.0, b12359) on Qwen3.6-35B-A3B Q4_K_M (18.6 GB of experts),
-RTX 4090, Ryzen 9 7950X3D, 8k context, default (mmap) loading, 2026-11-15. Predicted tok/s with a warm cache:
+- Measured with llama.cpp's `scripts/moe-cache-tune.py` (v1.0.0, b12359) on Qwen3.6-35B-A3B Q4_K_M (18.6 GB of
+  experts), RTX 4090, Ryzen 9 7950X3D, 8k context, default (mmap) loading, 2026-11-15.
+
+Predicted tok/s with a warm cache:
 
 | Cache MiB | share 0 | share 0.8 | share 0.95 |
 | --- | --- | --- | --- |
@@ -260,28 +277,34 @@ RTX 4090, Ryzen 9 7950X3D, 8k context, default (mmap) loading, 2026-11-15. Predi
 | 9280 | 105.7 | 106.5 | 108.0 |
 | all experts on the GPU | 118.6 | | |
 
-On this PC the CPU share helps (the tool measured uploads at 19.8 GiB/s, the CPU at 71.7 GiB/s): use `-1`, a cache of
-what VRAM allows, share `0.95`. A small cache with share 0 is slow. Another PC may differ; the script tunes it there.
-Use this pack's copy, `tools\moe_cache_tune.py`: the original stops each server with SIGINT, which Python cannot
-send on Windows, and the copy has the Windows change. It drives `llama-server.exe`, which the wheel does not ship;
-take it from the llama.cpp release that matches the wheel (for 0.4.7: `llama-b12359-bin-win-cuda-13.5-x64.zip` and
-`cudart-llama-bin-win-cuda-13.5-x64.zip`). Pass your own `-m`, `-c`, `-t` and load flags, plus `-cmoe`:
+- On this PC the CPU share helps (the tool measured uploads at 19.8 GiB/s, the CPU at 71.7 GiB/s): use `-1`, a cache
+  of what VRAM allows, share `0.95`.
+- A small cache with share 0 is slow.
+- Another PC may differ; the script tunes it there.
+- Use this pack's copy, `tools\moe_cache_tune.py`: the original stops each server with SIGINT, which Python cannot
+  send on Windows, and the copy has the Windows change.
+- It drives `llama-server.exe`, which the wheel does not ship; take it from the llama.cpp release that matches the
+  wheel (for 0.4.7: `llama-b12359-bin-win-cuda-13.5-x64.zip` and `cudart-llama-bin-win-cuda-13.5-x64.zip`).
+- Pass your own `-m`, `-c`, `-t` and load flags, plus `-cmoe`:
 
 ```powershell
 & $py tools\moe_cache_tune.py --markdown --out .work\moe-tune -- <path>\llama-server.exe -m <model.gguf> -cmoe -ngl 99 -c 8192 -fa on -t 16
 ```
 
-Six runs of about two minutes each. The last table is the prediction; the tool's recommendation is under it.
+- Six runs of about two minutes each.
+- The last table is the prediction; the tool's recommendation is under it.
 
 ## Common Problems
 
 ### `DLL load failed`
 
-Most often caused by a wheel that does not match the Python ABI or by missing runtime DLLs. Recheck Python version and the wheel filename.
+- Most often caused by a wheel that does not match the Python ABI or by missing runtime DLLs.
+- Recheck Python version and the wheel filename.
 
 ### `No module named llama_cpp`
 
-The wheel was installed into the wrong Python. Use ComfyUI's embedded `python.exe`, not system Python.
+- The wheel was installed into the wrong Python.
+- Use ComfyUI's embedded `python.exe`, not system Python.
 
 ### It imports, but local GGUF generation fails
 

@@ -1,8 +1,8 @@
 # Third-party notices
 
-Luna-LLM-Tools is licensed under MIT (see `LICENSE`). It brings
-together two earlier packs of the same author: LLM_Prompt (MIT) and ComfyUI-StylePromptLibrary (Apache-2.0).
-This file lists what those packs credit or adapt from other projects.
+- Luna-LLM-Tools is licensed under MIT (see `LICENSE`).
+- It brings together two earlier packs of the same author: LLM_Prompt (MIT) and ComfyUI-StylePromptLibrary (Apache-2.0).
+- This file lists what those packs credit or adapt from other projects.
 
 | Source | Licence | Where it is used | What |
 |---|---|---|---|
@@ -15,9 +15,9 @@ This file lists what those packs credit or adapt from other projects.
 
 ## Licence of the shared frontend kit
 
-`web/luna_theme.mjs`, `web/luna_help.mjs` and `web/luna_collapse.mjs` (and `web/luna_pack_theme.js`,
-which uses them) are Apache-2.0, Copyright 2026 Luna AI Space. They stay Apache-2.0 inside this
-MIT pack. Copy them into another pack under Apache-2.0.
+- `web/luna_theme.mjs`, `web/luna_help.mjs` and `web/luna_collapse.mjs` (and `web/luna_pack_theme.js`, which uses them)
+  are Apache-2.0, Copyright 2026 Luna AI Space.
+- They stay Apache-2.0 inside this MIT pack. Copy them into another pack under Apache-2.0.
 
 ## Licences of the merged packs
 

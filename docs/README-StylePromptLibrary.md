@@ -2,7 +2,9 @@
 
 # Luna-StylePrompt and Luna-CombineStyles
 
-These two nodes are for selecting reusable image style descriptions from a categorized JSON library. It outputs clean style text that can be connected to an LLM prompt node, a prompt-building workflow, or directly into text conditioning when useful.
+- These two nodes are for selecting reusable image style descriptions from a categorized JSON library.
+- It outputs clean style text that can be connected to an LLM prompt node, a prompt-building workflow, or directly
+  into text conditioning when useful.
 
 The pack includes a cascading style picker, live search, a read-only preview panel, style strength controls, and a companion node for blending multiple style guides.
 
@@ -123,7 +125,8 @@ There are no extra Python packages to install.
 4. Pick a `Style`.
 5. Connect `style_guide` to your LLM prompt node, prompt builder, or conditioning workflow.
 
-You can also use `search` to filter styles by name across the entire library. When search text is present, it overrides the category/subcategory filter in the frontend.
+- You can also use `search` to filter styles by name across the entire library.
+- When search text is present, it overrides the category/subcategory filter in the frontend.
 
 ## Style Strength
 
@@ -137,7 +140,8 @@ The `strength` input lets you control how strongly the selected style should inf
 
 ### `instruction` mode
 
-Best when feeding an LLM prompt node. The node wraps the style text in a natural-language directive, such as:
+- Best when feeding an LLM prompt node.
+- The node wraps the style text in a natural-language directive, such as:
 
 ```text
 Apply the following style strongly, as the dominant visual treatment: ...
@@ -145,7 +149,9 @@ Apply the following style strongly, as the dominant visual treatment: ...
 
 ### `emphasis` mode
 
-Best only when feeding CLIP-style prompt text directly. The node outputs:
+- Best only when feeding CLIP-style prompt text directly.
+
+The node outputs:
 
 ```text
 (style text:1.25)
@@ -221,7 +227,8 @@ The node will load it automatically on restart.
 /style_prompt_library/content
 ```
 
-`web/style_library.js` uses those routes to populate cascading dropdowns, live search, and the preview box. The Python node still works without the JavaScript because the saved `style` value is what determines the output.
+- `web/style_library.js` uses those routes to populate cascading dropdowns, live search, and the preview box.
+- The Python node still works without the JavaScript because the saved `style` value is what determines the output.
 
 ## Troubleshooting
 
@@ -235,4 +242,5 @@ The node will load it automatically on restart.
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE).
+- Apache License 2.0.
+- See [LICENSE](LICENSE).

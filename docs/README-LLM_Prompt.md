@@ -8,9 +8,9 @@ This pack is aimed at image and video generation workflows where an LLM turns a 
 
 ### API video input
 
-Connect a ComfyUI **VIDEO** output to `Luna-LLMPromptAPI`'s `video` socket. To
-assemble frames and a soundtrack, use **Create Video** with images, audio, and
-the correct source frame rate. An image batch alone contains no audio.
+- Connect a ComfyUI **VIDEO** output to `Luna-LLMPromptAPI`'s `video` socket.
+- To assemble frames and a soundtrack, use **Create Video** with images, audio, and the correct source frame rate.
+- An image batch alone contains no audio.
 
 - `video_input_mode = auto` sends native video to Gemini, including embedded
   audio; other providers receive sampled still images. `native_video` explicitly
@@ -23,16 +23,17 @@ the correct source frame rate. An image batch alone contains no audio.
 - The existing `frames` socket still describes the **target clip length for H3
   validation**; it does not control input sampling.
 
-Native mode exports the logical clip as MP4/H.264, retaining its audio and trim,
-uploads it through Gemini Files, waits for processing, and deletes that temporary
-upload after generation (including error paths). Higher sampling rates/counts
-increase token use and cost. `timeout_seconds` also bounds the processing wait
-and individual SDK HTTP requests, rather than the entire export/upload/generation
-sequence. The `log` output identifies native video versus silent sampled frames.
-Image batches remain supported alongside video, in their original image order.
+- Native mode exports the logical clip as MP4/H.264, retaining its audio and trim, uploads it through Gemini Files,
+  waits for processing, and deletes that temporary upload after generation (including error paths).
+- Higher sampling rates/counts increase token use and cost.
+- `timeout_seconds` also bounds the processing wait and individual SDK HTTP requests, rather than the entire
+  export/upload/generation sequence.
+- The `log` output identifies native video versus silent sampled frames.
+- Image batches remain supported alongside video, in their original image order.
 
-Requires a video-capable Gemini model and `google-genai` with `VideoMetadata.fps`
-support. See [Google's video input documentation](https://ai.google.dev/gemini-api/docs/generate-content/video-understanding).
+- Requires a video-capable Gemini model and `google-genai` with `VideoMetadata.fps` support.
+- See [Google's video input
+  documentation](https://ai.google.dev/gemini-api/docs/generate-content/video-understanding).
 
 ## Nodes
 
@@ -78,7 +79,8 @@ cd ComfyUI/custom_nodes
 git clone https://github.com/lunaaispace-eng/Luna-LLM-Tools.git
 ```
 
-Restart ComfyUI after installing or updating Python files. Hard-refresh the browser after frontend JavaScript changes.
+- Restart ComfyUI after installing or updating Python files.
+- Hard-refresh the browser after frontend JavaScript changes.
 
 ## Requirements
 
@@ -90,10 +92,9 @@ Restart ComfyUI after installing or updating Python files. Hard-refresh the brow
 | `PyYAML` | Prompt preset frontmatter | Optional; without it, filenames become preset labels. |
 | `google-genai` | Gemini native API | Needed by `Luna-LLMPromptAPI` when using Gemini. |
 
-Windows users who want the local GGUF node should read the dedicated install guide:
-[docs/llama_cpp_windows_install.md](docs/llama_cpp_windows_install.md).
-The repo also includes a read-only doctor / explicit installer script:
-`tools/llama_cpp_windows_doctor.py`.
+- Windows users who want the local GGUF node should read the dedicated install guide:
+  [docs/llama_cpp_windows_install.md](docs/llama_cpp_windows_install.md).
+- The repo also includes a read-only doctor / explicit installer script: `tools/llama_cpp_windows_doctor.py`.
 
 ## Model Folder
 
@@ -108,7 +109,9 @@ ComfyUI/models/LLM/
 |   `-- mmproj-another-model.gguf
 ```
 
-The node scans recursively. Files with `mmproj` in the name are treated as projectors, not model entries. When several projectors are in the same folder, the closest filename match is preferred.
+- The node scans recursively.
+- Files with `mmproj` in the name are treated as projectors, not model entries.
+- When several projectors are in the same folder, the closest filename match is preferred.
 
 ## Luna-LLMPrompt
 
@@ -116,8 +119,10 @@ The local node runs GGUF models through `llama-cpp-python`.
 
 ### The node face
 
-The node shows only what you change for every prompt: the model, the preset, your own instructions
-(`custom_system_prompt`, replaces the preset when filled), your idea and the seed. Below them:
+- The node shows only what you change for every prompt: the model, the preset, your own instructions
+  (`custom_system_prompt`, replaces the preset when filled), your idea and the seed.
+
+Below them:
 
 - **Model card** - the model's quant, whether it has MTP (its own heads, or `MTP drafter` for a Gemma 4 with a
   matching drafter) and a vision projector, its size, and whether it
@@ -138,19 +143,23 @@ The node shows only what you change for every prompt: the model, the preset, you
 - **Last run** - time, tokens, tokens per second, how long it thought, and a `view thinking` link.
 - **✎ idea** - a large editor for your idea (Ctrl+Enter saves, Esc cancels).
 
-**⚙ Settings** (the gear in the title bar; in Nodes 2.0 on the face) opens a panel with every other setting:
-sampling, thinking, speed and memory, output, vision, debug. The panel is attached to the node's right edge:
-it pans, zooms and moves with the node, and stays open while you work on the canvas; the gear, ✕, `Done` or Esc
-close it. It shows what the run will really use. Changing thinking, the budget or MTP there switches the level
-to `custom` (your own values); `reset` goes back to the level. A setting fed by a wire is marked
-`set by a wire`. **ⓘ** explains the levels.
+- **⚙ Settings** (the gear in the title bar; in Nodes 2.0 on the face) opens a panel with every other setting:
+  sampling, thinking, speed and memory, output, vision, debug.
+- The panel is attached to the node's right edge: it pans, zooms and moves with the node, and stays open while you
+  work on the canvas; the gear, ✕, `Done` or Esc close it.
+- It shows what the run will really use.
+- Changing thinking, the budget or MTP there switches the level to `custom` (your own values); `reset` goes back to
+  the level.
+- A setting fed by a wire is marked `set by a wire`.
+- **ⓘ** explains the levels.
 
 Hidden settings keep their input sockets for existing wires, but a new wire cannot be dropped on them; open
 `Show all settings on the node` in the panel to wire one.
 
-Workflows saved with an older version of the node load with their values in the right settings, also when
-they were re-saved while the values were shifted (`web/llm_prompt_compat.js`); such a node runs as `custom`,
-exactly as it was saved. A node saved taller than its content (from the old layout) shrinks to fit on load.
+- Workflows saved with an older version of the node load with their values in the right settings, also when they were
+  re-saved while the values were shifted (`web/llm_prompt_compat.js`); such a node runs as `custom`, exactly as it was
+  saved.
+- A node saved taller than its content (from the old layout) shrinks to fit on load.
 
 All settings (the ones not on the face are in the ⚙ panel):
 
@@ -189,29 +198,33 @@ vision_mp
 validate
 ```
 
-`vision_mp` downscales input images to at most that many megapixels before encoding (default 2.0,
-about 2000 tokens per image on Qwen VL; 0 = full size). `validate = h3` checks MiniMax H3 prompt format and reports on `log`.
+- `vision_mp` downscales input images to at most that many megapixels before encoding (default 2.0, about 2000 tokens
+  per image on Qwen VL; 0 = full size).
+- `validate = h3` checks MiniMax H3 prompt format and reports on `log`.
 
-`mtp_draft_tokens` turns on MTP (multi-token prediction): the model's own MTP heads guess 2-3 tokens
-ahead and the model verifies them, so quality is unchanged and writing is about 2x faster (Qwen3.6 27B
-Q4_K_M on an RTX 4090: 21.5 -> 42-45 tok/s). 0 = off, 2-3 recommended. It needs llama-cpp-python 0.3.48+,
-a GGUF that still carries its MTP heads (an `...-MTP-GGUF` build; most quants and fine-tunes strip them),
-and a text-only run - it is skipped while a vision projector is loaded. The console says when it is skipped
-and why.
+- `mtp_draft_tokens` turns on MTP (multi-token prediction): the model's own MTP heads guess 2-3 tokens ahead and the
+  model verifies them, so quality is unchanged and writing is about 2x faster (Qwen3.6 27B Q4_K_M on an RTX 4090: 21.5
+  -> 42-45 tok/s). 0 = off, 2-3 recommended.
+- It needs llama-cpp-python 0.3.48+, a GGUF that still carries its MTP heads (an `...-MTP-GGUF` build; most quants and
+  fine-tunes strip them), and a text-only run - it is skipped while a vision projector is loaded.
+- The console says when it is skipped and why.
 
-Gemma 4 has no MTP heads of its own; Google publishes separate drafters (`mtp-gemma-4-12b-it.gguf`,
-`mtp-gemma-4-26B-A4B-it.gguf`, `mtp-gemma-4-E4B-it.gguf`, architecture `gemma4-assistant`). Put them anywhere in
-your LLM folders (e.g. `LLM/_mtp_drafters/`): they are hidden from the model list and paired automatically with
-any Gemma 4 model of the same width, fine-tunes included. The drafter needs llama-cpp-python 0.4.x and a
-context of 16k or less (the default), because it turns on `swa_full`, whose VRAM grows with the context.
-Measured on Gemma4 26B-A4B Q4_K_P, RTX 4090: 157 -> 184 tok/s for +1.4 GB at 8k (+0.6 GB at 4k, +2.9 GB at
-16k, where the node leaves it off). The model card shows `MTP drafter` when one is found.
+- Gemma 4 has no MTP heads of its own; Google publishes separate drafters (`mtp-gemma-4-12b-it.gguf`,
+  `mtp-gemma-4-26B-A4B-it.gguf`, `mtp-gemma-4-E4B-it.gguf`, architecture `gemma4-assistant`).
+- Put them anywhere in your LLM folders (e.g. `LLM/_mtp_drafters/`): they are hidden from the model list and paired
+  automatically with any Gemma 4 model of the same width, fine-tunes included.
+- The drafter needs llama-cpp-python 0.4.x and a context of 16k or less (the default), because it turns on `swa_full`,
+  whose VRAM grows with the context.
+- Measured on Gemma4 26B-A4B Q4_K_P, RTX 4090: 157 -> 184 tok/s for +1.4 GB at 8k (+0.6 GB at 4k, +2.9 GB at 16k,
+  where the node leaves it off).
+- The model card shows `MTP drafter` when one is found.
 
-`reasoning_budget` caps the thinking when thinking is on, like LM Studio's budget: -1 = unlimited, 0 = no
-thinking, N = after N reasoning tokens the model is told to stop and writes the prompt. Qwen 3.5+ and Gemma 4
-only. Measured with the Krea2 General preset (since removed) on Qwen3.6 27B + MTP 3: unlimited thinking ran ~4,500 tokens
-(56 s); 2048 gave a near-identical prompt in 32 s, 1024 a slightly shorter one in 21 s, 512 a complete but less
-detailed one in 15 s.
+- `reasoning_budget` caps the thinking when thinking is on, like LM Studio's budget: -1 = unlimited, 0 = no thinking,
+  N = after N reasoning tokens the model is told to stop and writes the prompt.
+- Qwen 3.5+ and Gemma 4 only.
+- Measured with the Krea2 General preset (since removed) on Qwen3.6 27B + MTP 3: unlimited thinking ran ~4,500 tokens
+  (56 s); 2048 gave a near-identical prompt in 32 s, 1024 a slightly shorter one in 21 s, 512 a complete but less
+  detailed one in 15 s.
 
 Optional inputs:
 
@@ -285,27 +298,34 @@ Workflows saved with older versions of the node load with their values in the ri
 | `Gemini (Antigravity)` | Your Gemini **subscription** through the Antigravity CLI (`agy`), read-only plan mode. | The CLI's own login. |
 | `Custom` | User-supplied OpenAI-compatible `server_url`. Use this for OpenRouter, llama.cpp server, vLLM, Ollama-compatible gateways, etc. | Optional, depending on server. |
 
-The subscription providers run the vendor's own CLI headless (the CLI must be installed and logged in). They
-use that subscription's quota, take a few seconds of CLI start-up per call, ignore the sampling sliders, and
-take their reasoning level from the quality card. Images are supported on all of them; Grok downscales them to
-fit Windows' command-line limit.
+- The subscription providers run the vendor's own CLI headless (the CLI must be installed and logged in).
+- They use that subscription's quota, take a few seconds of CLI start-up per call, ignore the sampling sliders, and
+  take their reasoning level from the quality card.
+- Images are supported on all of them; Grok downscales them to fit Windows' command-line limit.
 
-**LM Studio.** The model list, vision and reasoning options and load state come from LM Studio. A model this
-node loads is unloaded after the run (`unload_after_run`, on by default); a model you or another app (e.g. Luna
-Bridge) already loaded is used as it is and stays loaded. `context_length` (default 8k) applies only when this
-node loads the model — LM Studio would otherwise load a second copy. `min_p` and `repeat_penalty` are sent only
-to LM Studio.
+**LM Studio.**
+- The model list, vision and reasoning options and load state come from LM Studio.
+- A model this node loads is unloaded after the run (`unload_after_run`, on by default); a model you or another app
+  (e.g. Luna Bridge) already loaded is used as it is and stays loaded.
+- `context_length` (default 8k) applies only when this node loads the model — LM Studio would otherwise load a second
+  copy.
+- `min_p` and `repeat_penalty` are sent only to LM Studio.
 
-**Audio input.** Connect a ComfyUI **AUDIO** output to the `audio` socket (up to 15 minutes). It works with
-`Gemini` and `Gemini (Antigravity)`; Grok, OpenAI, Codex, Claude and LM Studio reject audio (tested 2026-10-12),
-so the node stops with a plain message on those.
+**Audio input.**
+- Connect a ComfyUI **AUDIO** output to the `audio` socket (up to 15 minutes).
+- It works with `Gemini` and `Gemini (Antigravity)`; Grok, OpenAI, Codex, Claude and LM Studio reject audio (tested
+  2026-10-12), so the node stops with a plain message on those.
 
-**Gemini model check.** Google keeps listing retired models. The node probes each listed Gemini model once a
-week (new ones at once) with a tiny call, and hides models that no longer answer or are answered by a newer
-model (on 2026-10-12: the three `gemini-2.5` models, `gemini-3.7-flash` → 3.8, `gemini-3.5-flash` → 3.6). A run
-that is answered by another model marks it the same way. Results live in `.api_models_check.json`.
+**Gemini model check.**
+- Google keeps listing retired models.
+- The node probes each listed Gemini model once a week (new ones at once) with a tiny call, and hides models that no
+  longer answer or are answered by a newer model (on 2026-10-12: the three `gemini-2.5` models, `gemini-3.7-flash` →
+  3.8, `gemini-3.5-flash` → 3.6).
+- A run that is answered by another model marks it the same way.
+- Results live in `.api_models_check.json`.
 
-The node intentionally has no `api_key` widget. Keys are read from process environment variables or `.env` files so workflow JSON does not leak credentials.
+- The node intentionally has no `api_key` widget.
+- Keys are read from process environment variables or `.env` files so workflow JSON does not leak credentials.
 
 Preferred `.env` location:
 
@@ -339,23 +359,26 @@ gemini_video_fps
 min_p, repeat_penalty, context_length, unload_after_run   (LM Studio)
 ```
 
-Optional inputs: `style`, `context`, `width` / `height`, `image`, `video`, `audio`, `frames`, `asset_brief`, `refs` (same
-meaning as on the local node). Every provider gets the `refs` labels: next to each picture where it takes text and
-pictures in turn, as an attach-order list on Codex, and in the file names on Antigravity.
+- Optional inputs: `style`, `context`, `width` / `height`, `image`, `video`, `audio`, `frames`, `asset_brief`, `refs`
+  (same meaning as on the local node).
+- Every provider gets the `refs` labels: next to each picture where it takes text and pictures in turn, as an
+  attach-order list on Codex, and in the file names on Antigravity.
 
-`gemini_thinking_level` applies to every Gemini 3 model. `gemini_thinking_budget` only applied to Gemini 2.5,
-which no longer answers new users; it stays in saved workflows and is not shown.
+- `gemini_thinking_level` applies to every Gemini 3 model.
+- `gemini_thinking_budget` only applied to Gemini 2.5, which no longer answers new users; it stays in saved workflows
+  and is not shown.
 
 ## Luna-GeminiImage
 
-One node for every Google Gemini image model, calling Google directly with the same
-`GEMINI_API_KEY` the `Luna-LLMPromptAPI` node uses — no ComfyUI credits, no proxy, and the key
-is never stored in the workflow. The `prompt` input is a plain string, so the text output of
-`Luna-LLMPromptAPI` wires straight into it: write the prompt with Gemini, render it with Gemini.
+- One node for every Google Gemini image model, calling Google directly with the same `GEMINI_API_KEY` the
+  `Luna-LLMPromptAPI` node uses — no ComfyUI credits, no proxy, and the key is never stored in the workflow.
+- The `prompt` input is a plain string, so the text output of `Luna-LLMPromptAPI` wires straight into it: write the
+  prompt with Gemini, render it with Gemini.
 
-**Model list is live.** The dropdown is built from `ListModels` on your own key and cached for
-24 hours in `.gemini_models.json`; new Google image models appear on their own. `refresh_models`
-forces a re-query, and `model: auto` picks the best one your key can see.
+**Model list is live.**
+- The dropdown is built from `ListModels` on your own key and cached for 24 hours in `.gemini_models.json`; new Google
+  image models appear on their own.
+- `refresh_models` forces a re-query, and `model: auto` picks the best one your key can see.
 
 Models seen on a current key:
 
@@ -367,22 +390,24 @@ Models seen on a current key:
 | `gemini-3.1-flash-lite-image` | 1K | 14 | none |
 | `gemini-2.5-flash-image` (Nano Banana, legacy) | 1K | 3 | none |
 
-Aspect ratios: `1:1 2:3 3:2 3:4 4:3 4:5 5:4 9:16 16:9 21:9`, or `auto` to let the model decide
-(which also lets an edit inherit the aspect of its reference image). Asking a model for a size
-it does not support is clamped down with a console note instead of failing the run.
+- Aspect ratios: `1:1 2:3 3:2 3:4 4:3 4:5 5:4 9:16 16:9 21:9`, or `auto` to let the model decide (which also lets an
+  edit inherit the aspect of its reference image).
+- Asking a model for a size it does not support is clamped down with a console note instead of failing the run.
 
-**Safety.** `safety` defaults to `block_none`, sending `BLOCK_NONE` on all four configurable
-categories — the same setting the `Luna-LLMPromptAPI` node uses for Gemini. Google's hard
-server-side filter still applies and cannot be changed from here; when it fires, the error
-carries `block_reason` (the prompt was rejected) and/or `finish_reason` (the image was).
+**Safety.**
+- `safety` defaults to `block_none`, sending `BLOCK_NONE` on all four configurable categories — the same setting the
+  `Luna-LLMPromptAPI` node uses for Gemini.
+- Google's hard server-side filter still applies and cannot be changed from here; when it fires, the error carries
+  `block_reason` (the prompt was rejected) and/or `finish_reason` (the image was).
 
-**Editing and reference images.** `reference_images` is a growing list of sockets: connect one
-and the next appears, up to 14 — the documented per-request ceiling. Each slot also accepts a
-batch, so a Batch Images node still works and its frames are expanded in place. References are
-sent before the instruction, which is the order Google's own editing examples use.
+**Editing and reference images.**
+- `reference_images` is a growing list of sockets: connect one and the next appears, up to 14 — the documented
+  per-request ceiling.
+- Each slot also accepts a batch, so a Batch Images node still works and its frames are expanded in place.
+- References are sent before the instruction, which is the order Google's own editing examples use.
 
-The 14 above is the *total*; Google publishes tighter budgets per reference kind, inside that
-total. Exceeding one of these does not error — the result just degrades:
+- The 14 above is the *total*; Google publishes tighter budgets per reference kind, inside that total.
+- Exceeding one of these does not error — the result just degrades:
 
 | Model | Objects (high-fidelity) | Character consistency | Style references |
 | --- | --- | --- | --- |
@@ -390,9 +415,10 @@ total. Exceeding one of these does not error — the result just degrades:
 | `gemini-3.1-flash-image` | 10 | 4 | 3 |
 | `gemini-3.1-flash-lite-image` | 14 | not supported | not supported |
 
-**Multimodal outputs.** A Gemini image response is a stream of parts, not an image: one call can
-return interleaved text and several images, and on the thinking models some of those images are
-interim drafts the model made while composing. They come out separately:
+**Multimodal outputs.**
+- A Gemini image response is a stream of parts, not an image: one call can return interleaved text and several images,
+  and on the thinking models some of those images are interim drafts the model made while composing.
+- They come out separately:
 
 | Output | Contents |
 | --- | --- |
@@ -406,11 +432,11 @@ image per call — so N images cost N times as much.
 
 ## Luna-GPTImage
 
-OpenAI's Images API called directly with `OPENAI_API_KEY` — no Codex CLI, no ComfyUI credits.
-With no reference image it generates; connect any image to `reference_images` and it edits.
-The inputs follow `Luna-GeminiImage`: `prompt`, `model`, `aspect_ratio`, `resolution`,
-`batch_count`, `seed`, growing `reference_images`, plus optional `width` / `height` from a
-size node (the output is then resized to exactly that size).
+- OpenAI's Images API called directly with `OPENAI_API_KEY` — no Codex CLI, no ComfyUI credits.
+- With no reference image it generates; connect any image to `reference_images` and it edits.
+- The inputs follow `Luna-GeminiImage`: `prompt`, `model`, `aspect_ratio`, `resolution`, `batch_count`, `seed`,
+  growing `reference_images`, plus optional `width` / `height` from a size node (the output is then resized to exactly
+  that size).
 
 | Model | Sizes | Quality | Transparent | `input_fidelity` |
 | --- | --- | --- | --- | --- |
@@ -420,37 +446,42 @@ size node (the output is then resized to exactly that size).
 | `gpt-image-1.5`, `gpt-image-1`, `chatgpt-image-latest` | 1024², 1536x1024, 1024x1536 | low … high | yes | yes |
 | `gpt-image-1-mini` | same three | low … high | yes | no |
 
-`resolution` is a pixel budget for the free-size models (1K ≈ 1 MP, 2K ≈ 4 MP, 4K = 3840x2160);
-sizes are snapped to the API's rules. On the fixed-size models the nearest of the three sizes is
-used. Settings a model cannot take are lowered or dropped with a note in `info`, not failed.
+- `resolution` is a pixel budget for the free-size models (1K ≈ 1 MP, 2K ≈ 4 MP, 4K = 3840x2160); sizes are snapped to
+  the API's rules.
+- On the fixed-size models the nearest of the three sizes is used.
+- Settings a model cannot take are lowered or dropped with a note in `info`, not failed.
 
-**Editing.** Every connected image goes to `/v1/images/edits` (live: 101 images accepted on the
-2.x models). The first image is the one being edited; the rest are references. Connect a ComfyUI
-`MASK` — from the mask editor, SAM or any segmentation node — to repaint only the white area of
-the first image (`invert_mask` flips it). The `alpha` output carries the transparency when
-`background` is `transparent`. There is no seed in the API; `seed` only re-runs the node.
+**Editing.**
+- Every connected image goes to `/v1/images/edits` (live: 101 images accepted on the 2.x models).
+- The first image is the one being edited; the rest are references.
+- Connect a ComfyUI `MASK` — from the mask editor, SAM or any segmentation node — to repaint only the white area of
+  the first image (`invert_mask` flips it).
+- The `alpha` output carries the transparency when `background` is `transparent`.
+- There is no seed in the API; `seed` only re-runs the node.
 
-**Billing is by tokens, not per image.** `info` prints the cost computed from the response's
-`usage` (text in $5, image in $8, image out $30 per 1M on 2.5 and gpt-image-2). Output tokens
-are fixed per size and quality — at 1024x1024 on 2.5: low 196 (~$0.006), medium 439 (~$0.013),
-high 1756 (~$0.053), xhigh 3122 (~$0.094), max 7024 (~$0.21). Reference images bill as image
-input tokens. `xhigh` / `max` are 2.5-only and are just more tokens and time, not a reasoning
-mode: the Images API rejects every reasoning/thinking parameter.
+**Billing is by tokens, not per image.**
+- `info` prints the cost computed from the response's `usage` (text in $5, image in $8, image out $30 per 1M on 2.5
+  and gpt-image-2).
+- Output tokens are fixed per size and quality — at 1024x1024 on 2.5: low 196 (~$0.006), medium 439 (~$0.013), high
+  1756 (~$0.053), xhigh 3122 (~$0.094), max 7024 (~$0.21).
+- Reference images bill as image input tokens.
+- `xhigh` / `max` are 2.5-only and are just more tokens and time, not a reasoning mode: the Images API rejects every
+  reasoning/thinking parameter.
 
-**`prompt_rewriter` (opt-in, off by default)** sends the job through the Responses API: a
-mainline model (`gpt-6-sol`, `gpt-5.6-sol`, …) reasons at `rewriter_effort`, rewrites the
-prompt and calls the image model as a tool; the rewrite is shown in `info`. In a side-by-side
-on a text-heavy infographic it gave no measurable gain in text accuracy over a direct call and
-sometimes added unrequested detail, for extra mainline tokens and ~10 s — so it is a prompt
-expander, not a quality switch. Mask edits always go direct.
+- **`prompt_rewriter` (opt-in, off by default)** sends the job through the Responses API: a mainline model
+  (`gpt-6-sol`, `gpt-5.6-sol`, …) reasons at `rewriter_effort`, rewrites the prompt and calls the image model as a
+  tool; the rewrite is shown in `info`.
+- In a side-by-side on a text-heavy infographic it gave no measurable gain in text accuracy over a direct call and
+  sometimes added unrequested detail, for extra mainline tokens and ~10 s — so it is a prompt expander, not a quality
+  switch.
+- Mask edits always go direct.
 
 ## Luna-GeminiOmniVideo
 
-Google's Omni video model (`gemini-omni-1.1-flash`; the preview model shuts down 2026-10-22 and was
-removed from the list) through the Interactions API (Omni rejects `generateContent`). Omni
-outputs **video only** — 10 s, 24 fps, with audio; there is no image output and no duration
-control. Aspect `16:9` / `9:16`; resolution `360p` / `720p` / `1080p` / `4k` (360p ≈ $0.34 per
-clip, 720p ≈ $1.01).
+- Google's Omni video model (`gemini-omni-1.1-flash`; the preview model shuts down 2026-10-22 and was removed from the
+  list) through the Interactions API (Omni rejects `generateContent`).
+- Omni outputs **video only** — 10 s, 24 fps, with audio; there is no image output and no duration control.
+- Aspect `16:9` / `9:16`; resolution `360p` / `720p` / `1080p` / `4k` (360p ≈ $0.34 per clip, 720p ≈ $1.01).
 
 - `generate` — text, or up to 3 `reference_images` (one image = image-to-video).
 - `edit video` — wire an earlier Omni node's `interaction_id` into `previous_interaction_id` to
@@ -558,11 +589,11 @@ tags.md
 
 ## Dataset Captioning
 
-`Luna-LoadImageForCaption` reads a folder (`directory`, `extensions`, `sort`) and outputs the next
-image with its `filename`, `directory` and the `remaining` count; `skip_existing` skips images
-that already have a caption file. Wire the image into `Luna-LLMPrompt` or `Luna-LLMPromptAPI` with a
-caption preset, then into `Luna-SaveCaption` with the same `filename` and `directory`. Each run
-captions one image; queue it as many times as `remaining` shows.
+- `Luna-LoadImageForCaption` reads a folder (`directory`, `extensions`, `sort`) and outputs the next image with its
+  `filename`, `directory` and the `remaining` count; `skip_existing` skips images that already have a caption file.
+- Wire the image into `Luna-LLMPrompt` or `Luna-LLMPromptAPI` with a caption preset, then into `Luna-SaveCaption` with
+  the same `filename` and `directory`.
+- Each run captions one image; queue it as many times as `remaining` shows.
 
 ## Positive / Negative Split
 
@@ -582,13 +613,15 @@ The parser accepts:
 - JSON objects with `positive` and `negative` fields
 - legacy pipe-separated `positive|negative`
 
-All markers and labels are stripped from the final outputs. If no split is found, the whole response goes to `positive` and `negative` is empty.
+- All markers and labels are stripped from the final outputs.
+- If no split is found, the whole response goes to `positive` and `negative` is empty.
 
 ## Advanced UI
 
-Both prompt nodes have their own face and ⚙ panel (see Luna-LLMPrompt and Luna-LLMPrompt API above), in the classic
-canvas and in Nodes 2.0. The old `Advanced` fold is retired. The face is the last widget and is never saved,
-so saved widget positions stay intact.
+- Both prompt nodes have their own face and ⚙ panel (see Luna-LLMPrompt and Luna-LLMPrompt API above), in the classic
+  canvas and in Nodes 2.0.
+- The old `Advanced` fold is retired.
+- The face is the last widget and is never saved, so saved widget positions stay intact.
 
 ## Frontend Helpers
 
@@ -617,22 +650,25 @@ Ideogram-style bbox generation/output in other node packs is unrelated and unaff
 ## Troubleshooting
 
 **No GGUF models found**
-Check that `.gguf` files are in `ComfyUI/models/LLM` or another folder registered with ComfyUI as an LLM model path.
+- Check that `.gguf` files are in `ComfyUI/models/LLM` or another folder registered with ComfyUI as an LLM model path.
 
 **Local node fails because llama-cpp is missing or broken**
-The pack should still load API/Grok nodes. The local node raises a clear error only when it needs to load a GGUF model.
+- The pack should still load API/Grok nodes.
+- The local node raises a clear error only when it needs to load a GGUF model.
 
 **API key not found**
-Set the key before launching ComfyUI, or add it to `ComfyUI/.env`.
+- Set the key before launching ComfyUI, or add it to `ComfyUI/.env`.
 
 **Advanced button looks stale after update**
-Hard-refresh the browser with `Ctrl+Shift+R`.
+- Hard-refresh the browser with `Ctrl+Shift+R`.
 
 **Python node changes do not appear**
-Restart ComfyUI fully. Browser refresh is not enough for Python changes.
+- Restart ComfyUI fully.
+- Browser refresh is not enough for Python changes.
 
 **Prompt output still contains labels or markers**
-That should be stripped by `output_cleaner.py`. Keep the raw model output for debugging if it happens.
+- That should be stripped by `output_cleaner.py`.
+- Keep the raw model output for debugging if it happens.
 
 ## Credits
 
@@ -646,6 +682,9 @@ Special thanks to:
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+- MIT.
+- See [LICENSE](LICENSE).
 
-This project depends on ComfyUI. If redistributed as a bundled package with ComfyUI, the combined distribution may be subject to ComfyUI's GPL-3.0 license terms.
+- This project depends on ComfyUI.
+- If redistributed as a bundled package with ComfyUI, the combined distribution may be subject to ComfyUI's GPL-3.0
+  license terms.
