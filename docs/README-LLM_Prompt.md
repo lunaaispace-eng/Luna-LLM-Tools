@@ -543,7 +543,7 @@ Preset files live in:
 prompts/*.md
 ```
 
-Current library size: 25 Markdown presets.
+Current library size: 24 Markdown presets.
 
 Each file can include YAML frontmatter:
 
@@ -568,7 +568,6 @@ illustrious.md
 image_analysis.md
 image_caption.md
 image_edit.md
-Krea2_Architect_Adult_NSFW.md
 MinimaxH3_I2V_Architect.md
 MinimaxH3_i2v_Vision.md
 MinimaxH3_Image_Edit.md

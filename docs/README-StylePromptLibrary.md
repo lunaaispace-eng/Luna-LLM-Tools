@@ -17,7 +17,7 @@ The pack includes a cascading style picker, live search, a read-only preview pan
 
 ## Features
 
-- 377 local style entries across three JSON packs.
+- 341 local style entries across two JSON packs.
 - Cascading `Category -> Subcategory -> Style` controls.
 - Live search across the full style library.
 - Read-only preview of the selected style text.
@@ -39,8 +39,7 @@ Luna-LLM-Tools/   (the files of these nodes)
 |-- style_creator.md
 |-- styles/
 |   |-- styles_library.json
-|   |-- realism_style_pack_45.json
-|   `-- nsfw_cinematic_styles.json
+|   `-- realism_style_pack_45.json
 |-- web/
 |   `-- style_library.js
 `-- README.md
@@ -54,9 +53,8 @@ The node loads every JSON file in `styles/`.
 | --- | ---: | --- |
 | `styles_library.json` | 296 | Main general-purpose style library. |
 | `realism_style_pack_45.json` | 45 | Realism-focused style pack. |
-| `nsfw_cinematic_styles.json` | 36 | Optional adult style pack. Remove this file if you do not want adult styles loaded. |
 
-Total local entries: 377.
+Total local entries: 341.
 
 ## Style Schema
 

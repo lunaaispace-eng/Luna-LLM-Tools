@@ -39,3 +39,7 @@ design/
 .agents/
 # Agent scratch, deleted after use (see AGENTS.md).
 .work/
+
+# NSFW files kept local: loaded from disk, never pushed (SPEC.md § 1)
+prompts/Krea2_Architect_Adult_NSFW.md
+styles/nsfw_cinematic_styles.json
