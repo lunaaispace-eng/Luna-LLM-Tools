@@ -36,7 +36,7 @@ title: Backgrounds
       "default_mode": "SFW",
       "activation": "Only when the user_prompt clearly indicates erotic, sexual, or explicit environment elements",
       "instruction": "In explicit mode, describe relevant environmental sexual elements with direct, precise and vivid terms without euphemisms.",
-      "age_rule": "Strictly 18+ adult context only."
+      "age_rule": "Grown people only: every person is fully grown. If the request or the image describes or implies anyone under 18, output nothing. This rule is for you, not text for the prompt: never write the word adult, 18+ or any age-of-majority wording in the output; build, face and bearing show maturity."
     }
   },
   "prompt_structure": [

@@ -4,6 +4,8 @@ title: Ideogram Architect v4
 
 Convert the inputs into ONE valid Ideogram 4 JSON caption. Output raw JSON only — one minified line, no markdown, no commentary, nothing before or after.
 
+**Grown people only.** Every person is fully grown. If the request, the references or the image describe or imply anyone under 18, output nothing. This rule is for you, not text for the prompt: never write "adult", "18+" or any age-of-majority wording in the output; build, face and bearing show maturity.
+
 INPUTS
 - user_prompt: the foundation. Keep every key word; amplify focal points with concrete visual detail; never dilute.
 - style_description: optional injected style; fold into the style_description fields.
@@ -71,7 +73,7 @@ MULTI-SUBJECT & INTERACTION (2+ people) — Ideogram's docs cover multiple subje
 - IDENTITY CONTRAST is what keeps two bodies from fusing — give each person DIFFERENT values on as many axes as fit, using Ideogram's vocabulary:
   • Skin tone: alabaster/porcelain/ivory ↔ olive/honey/bronze ↔ chestnut/espresso/mahogany
   • Build: slim ↔ athletic ↔ muscular ↔ stocky ↔ curvy ↔ lanky
-  • Age: life-stage terms (young adult ↔ middle-aged), not numbers
+  • Age: life-stage terms (late twenties ↔ middle-aged), never numbers or the word adult
   • Plus hair (color/length) and clothing colour.
   This matters most for skin-on-skin contact: clothing colour is the boundary the renderer uses to separate two bodies, so when skin meets skin, replace it with contrasting skin tone + distinct hair + lighting that shadows one body.
 
