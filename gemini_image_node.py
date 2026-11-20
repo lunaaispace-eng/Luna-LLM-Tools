@@ -54,7 +54,7 @@ from comfy_api.latest import io
 # Same key resolver the Luna-LLMPromptAPI node uses — env var, then
 # <ComfyUI root>/.env, then <node folder>/.env. Keys never touch the workflow.
 from .llm_prompt_api_node import _resolve_api_key, _comfyui_root
-from . import luna_naming
+from .api_refs import at_replace, place_refs, refs_tip
 
 # ---------------------------------------------------------------------------
 # Static option sets (verified against google-genai 2.7.0 types.ImageConfig
@@ -376,7 +376,8 @@ class GeminiImageNode(io.ComfyNode):
                             "Wire the positive output of Luna-LLMPromptAPI straight in here. Point at a "
                             "reference with @image1, @image2 ...: N is its place among the images sent "
                             "(slot order, a batch expanded in place); it is sent as 'Image N'. One with "
-                            "no such image is sent as words, with a warning in the console."),
+                            "no such image is sent as words, with a warning in the console. With `refs` wired "
+                            "and its loader's @ names, @imageN is the loader's card N instead."),
                 io.Combo.Input(
                     "model", options=model_options, default="auto",
                     tooltip="Live list from ListModels on your key, cached 24h. "
@@ -464,6 +465,11 @@ class GeminiImageNode(io.ComfyNode):
                     "refresh_models", default=False,
                     tooltip="Re-query ListModels on the next run and rewrite the cache. "
                             "New models show up in the combo after a browser refresh."),
+                # Added last: a socket-only input, so saved widget positions are unchanged.
+                io.Custom("LUNA_H3_REFS").Input(
+                    "refs", optional=True,
+                    tooltip=refs_tip("the reference images", REF_SLOTS).replace(
+                        f"up to {REF_SLOTS} in all", f"up to the model's limit ({REF_SLOTS}, 2.5 Flash Image 3)")),
             ],
             outputs=[
                 io.Image.Output("image", tooltip="The final render(s)."),
@@ -597,7 +603,7 @@ class GeminiImageNode(io.ComfyNode):
                 safety="block_none", response_mode="image + text",
                 include_thought_images=False,
                 timeout=180, max_retries=2, refresh_models=False,
-                reference_images=None, reference_images_2=None) -> io.NodeOutput:
+                reference_images=None, reference_images_2=None, refs=None) -> io.NodeOutput:
         # person_generation is accepted and ignored: workflows saved against the
         # first version of this node still carry the widget value. Vertex-only.
         # reference_images_2 likewise: it was the second fixed socket before the
@@ -635,12 +641,14 @@ class GeminiImageNode(io.ComfyNode):
 
         caps = _caps_for(model)
 
-        refs = _collect_refs(reference_images, reference_images_2)
-        # The user's @ names: @imageN is the N-th image sent (the grown slots in order, then the legacy
-        # reference_images_2), as Image N. Every collected image is sent (_build_contents only warns past the cap).
-        prompt, warnings = luna_naming.replace(prompt, None, "cloud", {"image": len(refs)})
-        for w in warnings:
-            print(f"[Luna-GeminiImage] {w}")
+        # The refs pictures first, then the wired ones (the grown slots in order, then the legacy reference_images_2),
+        # cut to the model's max_refs when refs carries pictures. Without refs pictures every wired image is sent
+        # (_build_contents only warns past the cap), as before.
+        refs, naming = place_refs("Luna-GeminiImage", refs, _collect_refs(reference_images, reference_images_2),
+                                  caps["max_refs"])
+        # The user's @ names: with the loader's naming, @imageN is its card N wherever it lands; else @imageN is the
+        # N-th image sent. Sent as Image N.
+        prompt = at_replace("Luna-GeminiImage", prompt, naming, "cloud", {"image": len(refs)})
 
         config = cls._build_config(types, model, caps, aspect_ratio, resolution,
                                    temperature, top_p, top_k, seed,

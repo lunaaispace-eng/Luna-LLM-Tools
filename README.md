@@ -27,10 +27,15 @@ git clone https://github.com/lunaaispace-eng/Luna-LLM-Tools
 
 ## Node tree
 
-- **Luna-LLMPrompt**: Writes prompts with a local GGUF model (llama-cpp); reads pictures from Luna-ImageLoader `refs`;
-  turns your @image1, @video1, @audio1 into the target model's tags.
-- **Luna-LLMPromptAPI**: Writes prompts with cloud, LM Studio or subscription models; reads Luna-ImageLoader `refs` and
-  turns @ names into tags too.
+- **Luna-LLMPrompt**: Writes prompts with a local GGUF model (llama-cpp); reads `refs` from Luna-ImageLoader,
+  Luna-H3-AssetLoader or Luna-H3-RefsOut; turns your @image1, @video1, @audio1 into the target model's tags. `fps`
+  (optional, last): the frame rate of the `video` frames, unwired 24.
+- **Luna-LLMPromptAPI**: Writes prompts with cloud, LM Studio or subscription models; reads the same `refs` and turns @ names
+  into tags too.
+- Both writers send `refs` pictures each at its own size after `Image N (role, WxH)`, and each clip as 4 stills (first and
+  last included) after `Video K, frame F of N (WxH)`. The clip sounds, standalone sounds, song and vocal stem go only where the
+  model takes audio (Gemini, Gemini (Vertex) and Gemini (Antigravity) without Gemma; Gemma 4 with its projector on
+  Luna-LLMPrompt). Elsewhere the brief names no sound and `@audioN` becomes words with a warning.
 - **Luna-StylePrompt**: Picks an image style from a categorized library.
 - **Luna-CombineStyles**: Blends up to 3 styles; the first one leads.
 - **Luna-LoadImageForCaption**: Loads the next uncaptioned image in a folder, one per run.
@@ -47,6 +52,12 @@ git clone https://github.com/lunaaispace-eng/Luna-LLM-Tools
 - **Luna-GrokVideoExtend**: Grok video extension with your API key.
 - The image and video nodes above also turn an @image1 typed into their `prompt` into the tag their model reads
   (details: [docs/README-LLM_Prompt.md](docs/README-LLM_Prompt.md), @ names).
+- Each of them takes `refs` (last input, from Luna-ImageLoader, Luna-H3-AssetLoader or Luna-H3-RefsOut). Luna-GPTImage,
+  Luna-GeminiImage, Luna-GeminiOmniVideo, Luna-GrokVideoReference and Luna-GrokVideoFrames send its pictures first in their
+  reference list, then the wired ones, up to the node's limit; @imageN stays the loader's card N. Luna-GrokImage,
+  -GrokImageEdit, -GrokVideo, -GrokVideoEdit and -GrokVideoExtend send no picture from it and warn.
+- Luna-GrokVideo, -GrokVideoReference, -GrokVideoFrames and -GrokVideoExtend take an optional `seconds` socket (from
+  Luna-H3-Canvas `seconds` or Luna-LoadVideo `duration`): rounded up to whole seconds, it wins over `duration`.
 
 ## Replaces
 

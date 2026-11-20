@@ -32,7 +32,8 @@ import numpy as np
 import torch
 from PIL import Image
 
-from . import luna_naming
+from .api_refs import (REFS_TIP_NONE, at_replace, place_refs, refs_not_sent, refs_tip, seconds_duration,
+                       seconds_tip)
 
 XAI_BASE_URL = "https://api.x.ai/v1"
 _KEY_NAMES = ("XAI_API_KEY", "GROK_API_KEY")
@@ -309,16 +310,15 @@ def _prompt_in(tip: str) -> tuple:
 
 
 _AT_WORDS = "One with no such image is sent as words, with a warning in the console."
+_AT_REFS = (" With `refs` wired and its loader's @ names, @imageN is the loader's card N instead; its tag counts the "
+            "pictures sent ahead of the reference list.")
 
 
 def _at_names(node_id: str, prompt: str, images: int = 0, clips: int = 0) -> str:
     """The user's @ names in a Grok prompt: @imageN -> <IMAGE_{N-1}>, N being the image's place among those the
     node sends, in the order its tooltip states. One with no such image, and every @videoN / @audioN (the Grok
     row has no clip or sound tag), becomes words; the warnings go to the console."""
-    text, warnings = luna_naming.replace(prompt, None, "grok", {"image": images, "video": clips})
-    for w in warnings:
-        print(f"[{node_id}] {w}")
-    return text
+    return at_replace(node_id, prompt, None, "grok", {"image": images, "video": clips})
 
 
 # Optional connectable size inputs (e.g. from Resolution-Master). When both are
@@ -330,6 +330,13 @@ _WIDTH_IN = ("INT", {"default": 0, "min": 0, "max": 32768, "forceInput": True,
                                 "aspect_ratio (and resize image output to exactly this size)."})
 _HEIGHT_IN = ("INT", {"default": 0, "min": 0, "max": 32768, "forceInput": True,
                       "tooltip": "Optional. Height from a size node. See width."})
+
+# `refs` on a node without a reference list, and the Grok video nodes' `seconds` socket (both sockets only).
+_REFS_NONE = ("LUNA_H3_REFS", {"tooltip": REFS_TIP_NONE})
+
+
+def _seconds_in(lo: int, hi: int, what: str = "the clip length", extra: str = "") -> tuple:
+    return ("FLOAT", {"forceInput": True, "tooltip": seconds_tip(lo, hi, what) + extra})
 
 
 def _ar_value(ar: str) -> float:
@@ -379,12 +386,15 @@ class GrokImageAPINode:
         }, "optional": {
             "width": _WIDTH_IN,
             "height": _HEIGHT_IN,
+            # appended last (socket only), so saved widget positions are unchanged
+            "refs": _REFS_NONE,
         }}
 
     def generate(self, model, prompt, aspect_ratio, number_of_images, resolution, seed,
-                 timeout_seconds, quality="default", width=0, height=0):
+                 timeout_seconds, quality="default", width=0, height=0, refs=None):
         if not prompt.strip():
             raise ValueError("Prompt is required.")
+        refs_not_sent("Luna-GrokImage", refs)
         if width and height and width > 0 and height > 0:
             aspect_ratio = _nearest_ar(int(width), int(height), _IMAGE_AR)
         prompt = _at_names("Luna-GrokImage", prompt)
@@ -432,12 +442,15 @@ class GrokImageEditAPINode:
         }, "optional": {
             "width": _WIDTH_IN,
             "height": _HEIGHT_IN,
+            # appended last (socket only), so saved widget positions are unchanged
+            "refs": _REFS_NONE,
         }}
 
     def generate(self, model, image, prompt, resolution, number_of_images, aspect_ratio,
-                 seed, timeout_seconds, width=0, height=0):
+                 seed, timeout_seconds, width=0, height=0, refs=None):
         if not prompt.strip():
             raise ValueError("Prompt is required.")
+        refs_not_sent("Luna-GrokImageEdit", refs)
         frames = list(_iter_images(image))
         n_in = len(frames)
         # Per-model input caps, LIVE-verified 2026-10-04: image / image-2.0 take
@@ -498,12 +511,16 @@ class GrokVideoAPINode:
             "timeout_seconds": ("INT", {"default": 120, "min": 10, "max": 600}),
             # appended last so saved workflows keep their widget positions
             "generate_audio": _GEN_AUDIO,
-        }, "optional": {"image": ("IMAGE",), "width": _WIDTH_IN, "height": _HEIGHT_IN}}
+        }, "optional": {"image": ("IMAGE",), "width": _WIDTH_IN, "height": _HEIGHT_IN,
+                        # appended last (sockets only), so saved widget positions are unchanged
+                        "seconds": _seconds_in(1, 15), "refs": _REFS_NONE}}
 
     def generate(self, model, prompt, resolution, aspect_ratio, duration, seed,
-                 timeout_seconds, generate_audio=True, image=None, width=0, height=0):
+                 timeout_seconds, generate_audio=True, image=None, width=0, height=0, seconds=None, refs=None):
         if not prompt.strip() and image is None:
             raise ValueError("Prompt is required for text-to-video.")
+        duration = seconds_duration("Luna-GrokVideo", seconds, duration, 1, 15)
+        refs_not_sent("Luna-GrokVideo", refs)
         if width and height and width > 0 and height > 0:
             aspect_ratio = _nearest_ar(int(width), int(height), _VIDEO_AR[1:])
         _check_video_resolution(model, resolution)
@@ -549,7 +566,7 @@ class GrokVideoReferenceAPINode:
             "prompt": _prompt_in("Text prompt. Optional when an image, reference or voice is connected. "
                                  "@image1, @image2 ... count first_frame (when connected) and then "
                                  "reference_images in batch order, sent as <IMAGE_0>, <IMAGE_1> ...; voices "
-                                 "are <AUDIO_0> ... (write those tags as they are). " + _AT_WORDS),
+                                 "are <AUDIO_0> ... (write those tags as they are). " + _AT_WORDS + _AT_REFS),
             "resolution": (["480p", "720p"],),  # any reference request at 1080p is a 400
             "aspect_ratio": (_VIDEO_AR,),
             "duration": ("INT", {"default": 6, "min": 1, "max": 15}),
@@ -571,16 +588,25 @@ class GrokVideoReferenceAPINode:
                                  "Counted with the presets; 3 total."}),
             "width": _WIDTH_IN,
             "height": _HEIGHT_IN,
+            # appended last (sockets only), so saved widget positions are unchanged
+            "seconds": _seconds_in(1, 15),
+            "refs": ("LUNA_H3_REFS", {"tooltip": refs_tip("reference_images", _MAX_REFS)
+                                      + " A wired first_frame stays <IMAGE_0>, ahead of them."}),
         }}
 
     def generate(self, model, prompt, resolution, aspect_ratio, duration, seed,
                  timeout_seconds, generate_audio=True, voice_1="none", voice_2="none",
                  voice_3="none", reference_images=None, first_frame=None,
-                 custom_voice_ids="", width=0, height=0):
+                 custom_voice_ids="", width=0, height=0, seconds=None, refs=None):
         if width and height and width > 0 and height > 0:
             aspect_ratio = _nearest_ar(int(width), int(height), _VIDEO_AR[1:])
         _check_video_resolution(model, resolution, mode="reference")
+        duration = seconds_duration("Luna-GrokVideoReference", seconds, duration, 1, 15)
         frames = list(_iter_images(reference_images)) if reference_images is not None else []
+        # refs pictures first, then the wired references, cut to 14 when refs carries pictures; without them a wired
+        # batch past 14 is refused as before. The first frame is sent ahead of the list (<IMAGE_0>).
+        frames, naming = place_refs("Luna-GrokVideoReference", refs, frames, _MAX_REFS,
+                                    before=1 if first_frame is not None else 0)
         if len(frames) > _MAX_REFS:
             raise ValueError(f"xAI takes at most {_MAX_REFS} reference images (got {len(frames)}).")
         voices = _voice_refs(voice_1, voice_2, voice_3, custom_voice_ids)
@@ -601,8 +627,8 @@ class GrokVideoReferenceAPINode:
             body["image"] = {"url": _tensor_to_data_uri(next(_iter_images(first_frame)))}
         if "prompt" in body:
             # Numbering as the first_frame tooltip states: the pinned first frame is <IMAGE_0>, the references follow.
-            body["prompt"] = _at_names("Luna-GrokVideoReference", body["prompt"],
-                                       images=(1 if first_frame is not None else 0) + len(frames))
+            body["prompt"] = at_replace("Luna-GrokVideoReference", body["prompt"], naming, "grok",
+                                        {"image": (1 if first_frame is not None else 0) + len(frames)})
         init = _post("/videos/generations", key, body, timeout=float(timeout_seconds))
         url = _poll_video(init["request_id"], key, poll_timeout=float(timeout_seconds))
         return (_video_output(url, key),)
@@ -630,7 +656,7 @@ class GrokVideoFramesAPINode:
             "prompt": _prompt_in("Text prompt. Optional when a frame is connected. @image1, @image2 ... "
                                  "count what is sent, in this order: first_frame, last_frame, the keyframes "
                                  "by time, then reference_images; sent as <IMAGE_0>, <IMAGE_1> ... "
-                                 + _AT_WORDS),
+                                 + _AT_WORDS + _AT_REFS),
             "resolution": (["480p", "720p"],),  # 1080p is a 400 with frames
             "aspect_ratio": (_VIDEO_AR,),
             "duration": ("INT", {"default": 6, "min": 1, "max": 15}),
@@ -645,15 +671,19 @@ class GrokVideoFramesAPINode:
             "reference_images": ("IMAGE", {"tooltip": "Optional extra references (up to 14)."}),
             "width": _WIDTH_IN,
             "height": _HEIGHT_IN,
+            # appended last (sockets only), so saved widget positions are unchanged
+            "seconds": _seconds_in(1, 15, extra=" The keyframe times are checked against it."),
+            "refs": ("LUNA_H3_REFS", {"tooltip": refs_tip("reference_images", _MAX_REFS)
+                                      + " The frames and keyframes stay ahead of them in the numbering."}),
         }}
 
     def generate(self, model, prompt, resolution, aspect_ratio, duration, seed,
                  timeout_seconds, generate_audio=True, first_frame=None, last_frame=None,
-                 reference_images=None, width=0, height=0, **kw):
+                 reference_images=None, width=0, height=0, seconds=None, refs=None, **kw):
         if width and height and width > 0 and height > 0:
             aspect_ratio = _nearest_ar(int(width), int(height), _VIDEO_AR[1:])
         _check_video_resolution(model, resolution, mode="frames")
-        dur = int(duration)
+        dur = seconds_duration("Luna-GrokVideoFrames", seconds, duration, 1, 15)
         keyframes = []
         for i in range(1, 5):
             img = kw.get(f"keyframe_{i}")
@@ -680,16 +710,19 @@ class GrokVideoFramesAPINode:
             body["last_frame"] = {"url": _tensor_to_data_uri(next(_iter_images(last_frame)))}
         if keyframes:
             body["keyframes"] = sorted(keyframes, key=lambda k: k["timestamp_s"])
-        if reference_images is not None:
-            refs = list(_iter_images(reference_images))
-            if len(refs) > _MAX_REFS:
-                raise ValueError(f"xAI takes at most {_MAX_REFS} reference images.")
-            body["reference_images"] = [{"url": _tensor_to_data_uri(f)} for f in refs]
+        # refs pictures first in the reference list, then the wired references (cut to 14 when refs carries
+        # pictures; without them a wired batch past 14 is refused as before). Ahead of the list: the frames.
+        ahead = int((first_frame is not None) + (last_frame is not None) + len(keyframes))
+        wired = list(_iter_images(reference_images)) if reference_images is not None else []
+        ref_list, naming = place_refs("Luna-GrokVideoFrames", refs, wired, _MAX_REFS, before=ahead)
+        if len(ref_list) > _MAX_REFS:
+            raise ValueError(f"xAI takes at most {_MAX_REFS} reference images.")
+        if reference_images is not None or ref_list:
+            body["reference_images"] = [{"url": _tensor_to_data_uri(f)} for f in ref_list]
         if "prompt" in body:
             # Numbered in the order the body carries them: image (first frame), last_frame, keyframes, references.
-            sent = ((first_frame is not None) + (last_frame is not None) + len(keyframes)
-                    + len(body.get("reference_images") or []))
-            body["prompt"] = _at_names("Luna-GrokVideoFrames", body["prompt"], images=int(sent))
+            sent = ahead + len(body.get("reference_images") or [])
+            body["prompt"] = at_replace("Luna-GrokVideoFrames", body["prompt"], naming, "grok", {"image": sent})
         init = _post("/videos/generations", key, body, timeout=float(timeout_seconds))
         url = _poll_video(init["request_id"], key, poll_timeout=float(timeout_seconds))
         return (_video_output(url, key),)
@@ -711,11 +744,15 @@ class GrokVideoEditAPINode:
                                            "and aspect ratio, at most 720p."}),
             "seed": _SEED,
             "timeout_seconds": ("INT", {"default": 120, "min": 10, "max": 600}),
+        }, "optional": {
+            # appended last (socket only), so saved widget positions are unchanged
+            "refs": _REFS_NONE,
         }}
 
-    def generate(self, model, prompt, video, seed, timeout_seconds):
+    def generate(self, model, prompt, video, seed, timeout_seconds, refs=None):
         if not prompt.strip():
             raise ValueError("Prompt is required.")
+        refs_not_sent("Luna-GrokVideoEdit", refs)
         prompt = _at_names("Luna-GrokVideoEdit", prompt, clips=1)
         key = _resolve_xai_key()
         init = _post("/videos/edits", key, {
@@ -746,11 +783,17 @@ class GrokVideoExtendAPINode:
                                  "tooltip": "Seconds to ADD (2-10)."}),
             "seed": _SEED,
             "timeout_seconds": ("INT", {"default": 120, "min": 10, "max": 600}),
+        }, "optional": {
+            # appended last (sockets only), so saved widget positions are unchanged
+            "seconds": _seconds_in(2, 10, "the seconds to ADD"),
+            "refs": _REFS_NONE,
         }}
 
-    def generate(self, model, prompt, video, duration, seed, timeout_seconds):
+    def generate(self, model, prompt, video, duration, seed, timeout_seconds, seconds=None, refs=None):
         if not prompt.strip():
             raise ValueError("Prompt is required.")
+        duration = seconds_duration("Luna-GrokVideoExtend", seconds, duration, 2, 10)
+        refs_not_sent("Luna-GrokVideoExtend", refs)
         prompt = _at_names("Luna-GrokVideoExtend", prompt, clips=1)
         key = _resolve_xai_key()
         init = _post("/videos/extensions", key, {

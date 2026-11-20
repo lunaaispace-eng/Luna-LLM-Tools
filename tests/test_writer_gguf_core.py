@@ -208,11 +208,13 @@ class GGUFWriterCoreTest(unittest.TestCase):
         self.assertEqual(rec["invoke"]["user_prompt"],
                          "PICTURES:\n<Picture 1> = 1920x1080 (16:9, landscape)\n\nUSER PROMPT:\na red fox in snow")
 
-    def test_refs_is_last_input(self):
+    def test_refs_then_fps_are_the_last_inputs(self):
         inputs = self.mod.LLMPromptNode.define_schema().inputs
-        self.assertEqual([i.id for i in inputs][-2:], ["asset_brief", "refs"])
+        self.assertEqual([i.id for i in inputs][-3:], ["asset_brief", "refs", "fps"])
+        self.assertTrue(inputs[-2].optional)
+        self.assertEqual(inputs[-2].get_io_type(), "LUNA_H3_REFS")
         self.assertTrue(inputs[-1].optional)
-        self.assertEqual(inputs[-1].get_io_type(), "LUNA_H3_REFS")
+        self.assertEqual(inputs[-1].get_io_type(), "FLOAT")
 
     # ---- Writer hooks ---------------------------------------------------------------
 

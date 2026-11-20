@@ -657,6 +657,148 @@ def _refs_brief(asset_brief, refs) -> str:
     return brief if isinstance(brief, str) else ""
 
 
+# Stills taken from each `refs` clip (PROPOSED, Build 2 lane S5): evenly spaced, first and last included.
+REFS_CLIP_STILLS = 4
+
+
+def _refs_stills(refs) -> list[tuple[str, "torch.Tensor"]]:
+    """The clips of a LUNA_H3_REFS payload (refs["videos"], IMAGE batches) as labelled stills, in order.
+
+    Per clip k (<Video k+1> in the brief): REFS_CLIP_STILLS frames evenly spaced, first and last included, fewer
+    when the clip is shorter. Label "Video K, frame F of N (WxH)": K the clip's 1-based place in refs["videos"],
+    F the frame's 1-based index, N the clip's frame count, WxH the frame's own size. A missing or empty clip is
+    skipped and the others keep their numbers. Both writers send these after the refs pictures."""
+    if not isinstance(refs, dict):
+        return []
+    out: list[tuple[str, torch.Tensor]] = []
+    for k, clip in enumerate(refs.get("videos") or []):
+        if clip is None or not hasattr(clip, "ndim"):
+            continue
+        if clip.ndim == 3:
+            clip = clip[None, ...]
+        if clip.ndim != 4 or int(clip.shape[0]) == 0 or int(clip.shape[1]) == 0 or int(clip.shape[2]) == 0:
+            continue
+        total = int(clip.shape[0])
+        count = min(REFS_CLIP_STILLS, total)
+        idx = [round(i * (total - 1) / (count - 1)) for i in range(count)] if count > 1 else [0]
+        h, w = int(clip.shape[1]), int(clip.shape[2])
+        for i in idx:
+            out.append((f"Video {k + 1}, frame {i + 1} of {total} ({w}x{h})", clip[i]))
+    return out
+
+
+def _is_audio(a) -> bool:
+    """A ComfyUI AUDIO dict with at least one sample."""
+    wav = a.get("waveform") if isinstance(a, dict) else None
+    return wav is not None and hasattr(wav, "shape") and len(wav.shape) > 0 and int(wav.shape[-1]) > 0
+
+
+def _audio_seconds(a) -> float:
+    """The length of a ComfyUI AUDIO dict in seconds (0.0 when it has no sample rate)."""
+    rate = int(a.get("sample_rate") or 0) if isinstance(a, dict) else 0
+    return int(a["waveform"].shape[-1]) / rate if rate > 0 and _is_audio(a) else 0.0
+
+
+def _same_audio(a, b) -> bool:
+    """True when a and b are the very same sound: same sample rate and the same waveform tensor (the same object,
+    or equal shape and values)."""
+    if not (_is_audio(a) and _is_audio(b)):
+        return False
+    if int(a.get("sample_rate") or 0) != int(b.get("sample_rate") or 0):
+        return False
+    wa, wb = a["waveform"], b["waveform"]
+    if wa is wb:
+        return True
+    try:
+        return tuple(wa.shape) == tuple(wb.shape) and bool(torch.equal(wa, wb))
+    except Exception:
+        return False
+
+
+def _refs_sounds(refs, audio=None) -> list[tuple[str, dict]]:
+    """The sounds of a LUNA_H3_REFS payload as (label, AUDIO) pairs, in MiniMax's order.
+
+    Each clip's sound (refs["video_audios"], not None) "Audio n (the sound of Video K, S s)", then the standalone
+    sounds (refs["audios"]) "Audio n (S s)", n counted the way MiniMax numbers <Audio n> (each clip's sound right
+    before its clip, then the standalone sounds; empty slots skipped), as luna_naming.inventory does. Then the
+    song (refs["song"]) "Song (S s)" and the vocal stem (refs["vocals"]) "Vocal stem (S s)", named by their job.
+    The song is left out only when it is the very same sound as `audio` (the writer's wired input), so it is
+    not sent twice."""
+    if not isinstance(refs, dict):
+        return []
+    out: list[tuple[str, dict]] = []
+    n = 0
+    v_audio = refs.get("video_audios") or []
+    for k in range(len(refs.get("videos") or [])):
+        a = v_audio[k] if k < len(v_audio) else None
+        if _is_audio(a):
+            n += 1
+            out.append((f"Audio {n} (the sound of Video {k + 1}, {_audio_seconds(a):.2f} s)", a))
+    for a in refs.get("audios") or []:
+        if _is_audio(a):
+            n += 1
+            out.append((f"Audio {n} ({_audio_seconds(a):.2f} s)", a))
+    song, vocals = refs.get("song"), refs.get("vocals")
+    if _is_audio(song) and not _same_audio(song, audio):
+        out.append((f"Song ({_audio_seconds(song):.2f} s)", song))
+    if _is_audio(vocals):
+        out.append((f"Vocal stem ({_audio_seconds(vocals):.2f} s)", vocals))
+    return out
+
+
+def _sounds_too_long(sounds: list[tuple[str, dict]], limit: float) -> str:
+    """"" when every sound fits the route's limit in seconds, else one ASCII line naming the first that does not."""
+    for label, a in sounds:
+        if _audio_seconds(a) > limit:
+            return (f"The refs sounds are not sent: {label.split(' (')[0]} is {_audio_seconds(a):.1f} s, over this "
+                    f"route's {limit:g} s; the brief names no sound.")
+    return ""
+
+
+# A brief sentence that is a song or vocal-stem line (the loaders write "Song: ..."; the stem by its job).
+_SOUND_LINE_RE = re.compile(r"^(song|vocals?|vocal stem)\b", re.IGNORECASE)
+_AUDIO_TAG_RE = re.compile(r"<Audio \d+>")
+
+
+def _sentences(text: str) -> list[str]:
+    """A brief's sentences: a sentence ends at ". " (or a period and a line break) or at the end of the text."""
+    return [s for s in re.split(r"(?<=\.)\s+", text.strip()) if s.strip()]
+
+
+def _brief_without_sound(asset_brief, refs, naming) -> tuple[str, str]:
+    """The brief for a route that hears no sound, when `refs` carries one: (text, note).
+
+    The refs brief (no asset_brief wired, or a wired one that is the same text as refs["brief"]) is rebuilt from
+    refs["items"] with luna_naming.inventory(..., hear=False). Any other wired asset_brief loses every sentence that
+    names an <Audio n> or is a song or vocal-stem line; its names line is taken out (the caller writes it again,
+    without sound), and the note says how many sentences were left out (ASCII; "" when none)."""
+    refs = refs if isinstance(refs, dict) else {}
+    wired = str(asset_brief) if asset_brief and str(asset_brief).strip() else ""
+    refs_brief = refs.get("brief") if isinstance(refs.get("brief"), str) else ""
+    items = refs.get("items")
+    if (not wired or wired.strip() == refs_brief.strip()) and isinstance(items, dict):
+        return luna_naming.inventory(items, naming, "minimax", hear=False), ""
+    text = luna_naming.drop_names_line(wired or refs_brief)
+    dropped = 0
+    items = items if isinstance(items, dict) else {}
+    for key in ("song", "vocals"):
+        line = items.get(key)
+        if isinstance(line, str) and line.strip() and line.strip() in text:
+            dropped += len(_sentences(line))
+            text = text.replace(line.strip(), " ")
+    kept = []
+    for s in _sentences(text):
+        if _AUDIO_TAG_RE.search(s) or _SOUND_LINE_RE.match(s.strip()):
+            dropped += 1
+        else:
+            kept.append(s)
+    if not dropped:
+        return text.strip(), ""
+    note = (f"{dropped} sentence(s) of the {'asset_brief' if wired else 'refs brief'} left out: they name a "
+            f"sound, and this route sends the model no sound.")
+    return " ".join(kept), note
+
+
 def _pictures_log(counts: list[tuple[str, int]]) -> str:
     """One log line naming how many pictures each input sent, e.g. "Pictures: 1 from image, 3 from refs."."""
     return "Pictures: " + ", ".join(f"{n} from {name}" for name, n in counts if n) + "."
@@ -676,21 +818,33 @@ def _preset_row(system_prompt, custom_system_prompt) -> str | None:
     return load_preset_rows().get(system_prompt)
 
 
-def _naming_prepare(asset_brief, refs, user_prompt, preset_row, n_pictures: int) -> dict:
+def _naming_prepare(asset_brief, refs, user_prompt, preset_row, n_pictures: int, hear: bool = True,
+                    notes: list[str] | None = None) -> dict:
     """What a writer shows its model about the @ names, and what it replaces with afterwards.
 
     PICTURES text = _refs_brief(asset_brief, refs). Naming = the names line in that text, else refs["naming"]
     (luna_naming.pick); with neither and an @ token in the request, one made for the n_pictures the writer sends,
     numbered in the order it sends them. Row = the preset's row, else the naming's, else cloud.
+    hear: False when the route sends the model no refs sound. Then, if `refs` carries a sound, the text is
+    _brief_without_sound and the naming luna_naming.without_sound of it, so the brief names no sound; else the
+    text is today's. notes: lines for the log (the caller's, plus the left-out note).
     Returns {"brief": the PICTURES text for the core (None = pass asset_brief on unchanged), "naming", "row",
-    "mismatch": the preset/loader row warning or "", "warnings": the request's @ names with no item}."""
+    "mismatch": the preset/loader row warning or "", "warnings": the request's @ names with no item,
+    "notes": log lines, "rebuilt": True when the text was rebuilt for a route without sound}."""
     text = _refs_brief(asset_brief, refs)
     naming = luna_naming.pick(text, refs)
+    notes = [n for n in (notes or []) if n]
+    rebuilt = not hear and bool(_refs_sounds(refs))
+    if rebuilt:
+        text, note = _brief_without_sound(asset_brief, refs, naming)
+        naming = luna_naming.without_sound(naming)
+        if note:
+            notes.append(note)
     if naming is None and luna_naming.replace(user_prompt or "")[1]:
         naming = luna_naming.make(preset_row or "cloud", ["ref"] * max(int(n_pictures), 0))
     row = preset_row or (naming or {}).get("row") or "cloud"
-    state = {"brief": None, "naming": naming, "row": row, "warnings": [],
-             "mismatch": luna_naming.mismatch(preset_row, (naming or {}).get("row"))}
+    state = {"brief": text if rebuilt else None, "naming": naming, "row": row, "warnings": [], "notes": notes,
+             "rebuilt": rebuilt, "mismatch": luna_naming.mismatch(preset_row, (naming or {}).get("row"))}
     if naming is not None:
         state["brief"] = luna_naming.put_names_line(text, naming, row)
         # The request is sent as typed; its @ names are only checked, so one with no item warns even when the
@@ -706,7 +860,7 @@ def _naming_finish(state: dict, positive: str, negative: str, log: str, who: str
     positive, w_pos = luna_naming.replace(positive or "", naming, row)
     negative, w_neg = luna_naming.replace(negative or "", naming, row)
     lines = [state["mismatch"]] if state["mismatch"] else []
-    for w in state["warnings"] + w_pos + w_neg:
+    for w in list(state.get("notes") or []) + state["warnings"] + w_pos + w_neg:
         if w not in lines:
             lines.append(w)
     for line in lines:
@@ -725,6 +879,47 @@ def _gguf_pictures_sent(image=None, reference_image=None, refs=None) -> int:
     if reference_image is not None:
         n += 1
     return n + len(_refs_pictures(refs))
+
+
+def _gguf_takes_audio(model_name, load_mmproj="auto") -> bool:
+    """Whether Luna-LLMPrompt's route takes sound for this model (PROPOSED, Build 2 lane S5): the model has a
+    projector, load_mmproj is not "never", and its family adapter (pick_adapter, as _load_model picks it) declares
+    supports_audio. A model not in the scan takes none."""
+    if (load_mmproj or "auto") == "never":
+        return False
+    try:
+        model_path, mmproj_path = _resolve_model_paths(model_name)
+    except Exception:
+        return False
+    if mmproj_path is None:
+        return False
+    return bool(pick_adapter(model_path.name.lower(), _read_gguf_arch(model_path)).supports_audio)
+
+
+def _gguf_refs_hearing(model_name, load_mmproj, refs, audio=None) -> tuple[list[tuple[str, dict]], bool, str]:
+    """(the refs sounds to send as (label, encoded audio_url content), hears, note) for Luna-LLMPrompt.
+
+    The sounds go only when the route takes sound, each fits the encoder's MAX_AUDIO_DURATION_SECONDS and each
+    encodes (_audio_to_content); else none goes, the route counts as not hearing, and the note (ASCII) says why
+    when a sound was too long or failed to encode. They are encoded here, before the brief is written, so the
+    brief and the naming never claim a sound that was not sent. Without refs sounds: ([], True, "")."""
+    sounds = _refs_sounds(refs, audio)
+    if not _refs_sounds(refs):
+        return [], True, ""
+    if not _gguf_takes_audio(model_name, load_mmproj):
+        return [], False, ""
+    long_note = _sounds_too_long(sounds, MAX_AUDIO_DURATION_SECONDS)
+    if long_note:
+        return [], False, long_note
+    parts = []
+    for label, a in sounds:
+        try:
+            parts.append((label, _audio_to_content(a)))
+        except Exception as e:
+            reason = str(e).encode("ascii", "replace").decode("ascii")
+            return [], False, (f"The refs sounds are not sent: {label.split(' (')[0]} could not be encoded "
+                               f"({type(e).__name__}: {reason}); the brief names no sound.")
+    return parts, True, ""
 
 
 def _pick_device(device_choice: str) -> str:
@@ -1091,7 +1286,8 @@ def _video_tensor_to_contents(video: torch.Tensor, target_fps: float = 1.0,
                               source_fps: float = 30.0, n_ctx: int = 8192) -> list[dict]:
     """A [F,H,W,3] video tensor -> list of image_url dicts, FPS-subsampled.
 
-    ComfyUI image batches carry no FPS metadata, so source_fps is assumed 30.
+    ComfyUI image batches carry no FPS metadata: source_fps is the frames' rate (Luna-LLMPrompt passes its
+    `fps` socket, unwired 24; the 30 default here is kept for other callers).
     Frame count is derived from duration*target_fps, capped at MAX_VIDEO_FRAMES,
     and further reduced if it would blow past ~70% of the context window
     (each frame costs ~ESTIMATED_TOKENS_PER_IMAGE tokens).
@@ -2206,6 +2402,8 @@ class _LLMRunner:
         moe_cache_cpu_share: float = 0.0,
         asset_brief: str = "",
         refs=None,
+        fps: float = 24.0,
+        refs_sounds: list[tuple[str, dict]] | None = None,
         media_override: list[dict] | None = None,
     ):
         # Gate the chatty status prints for this run (warnings/errors still show).
@@ -2362,6 +2560,7 @@ class _LLMRunner:
         # replaces this whole assembly; the node never passes it.
         media_content: list[dict] = []
         picture_counts: list[tuple[str, int]] = []
+        refs_media_log = ""
 
         if media_override is not None:
             media_content = list(media_override)
@@ -2384,10 +2583,12 @@ class _LLMRunner:
                 media_content.append(_image_tensor_to_content(ref_frame, max_mp=vision_mp))
                 picture_counts.append(("reference_image", 1))
 
-            # Video frames, FPS-subsampled and context-budget aware.
+            # Video frames, FPS-subsampled and context-budget aware. The frames come at `fps`
+            # (the socket; unwired 24), so the clip's length is frames / fps.
             if video is not None:
+                source_fps = float(fps) if fps and float(fps) > 0 else 24.0
                 media_content.extend(
-                    _video_tensor_to_contents(video, target_fps=video_fps, n_ctx=n_ctx)
+                    _video_tensor_to_contents(video, target_fps=video_fps, source_fps=source_fps, n_ctx=n_ctx)
                 )
 
             # The pictures in `refs`, after the other media: each at its own shape
@@ -2398,6 +2599,11 @@ class _LLMRunner:
                 media_content.append(_image_tensor_to_content(frame, max_mp=vision_mp))
             if ref_pictures:
                 picture_counts.append(("refs", len(ref_pictures)))
+            # The clips in `refs` as stills, after its pictures, each after its "Video K, frame F of N" label.
+            ref_stills = _refs_stills(refs)
+            for label, frame in ref_stills:
+                media_content.append({"type": "text", "text": label})
+                media_content.append(_image_tensor_to_content(frame, max_mp=vision_mp))
 
             # Audio (Gemma-4 audio projector only). Never hard-fail on audio issues.
             if audio is not None:
@@ -2405,6 +2611,21 @@ class _LLMRunner:
                     media_content.append(_audio_to_content(audio))
                 except Exception as e:
                     print(f"[Luna-LLMPrompt] Audio could not be encoded ({e}); ignoring audio input.")
+            # The sounds in `refs`, each after its label, only when this model's route takes sound and
+            # every one encodes (_gguf_refs_hearing, all or none). refs_sounds: the node's execute() encodes them
+            # once, writes the brief for that result and hands the very parts here, so what is sent is what the
+            # brief names. None (a direct caller): worked out here, as before.
+            if refs_sounds is None:
+                ref_sounds = _gguf_refs_hearing(model_name, load_mmproj, refs, audio)[0]
+            else:
+                ref_sounds = list(refs_sounds)
+            for label, part in ref_sounds:
+                media_content += [{"type": "text", "text": label}, part]
+            sent_sounds = len(ref_sounds)
+            if ref_stills or sent_sounds:
+                refs_media_log = (f"From refs: {len(ref_stills)} still(s) of "
+                                  f"{len({lab.split(',')[0] for lab, _ in ref_stills})} clip(s), "
+                                  f"{sent_sounds} sound(s).")
 
         # Load model and generate. want_vision drives whether we load the vision
         # handler at all â€” only when image/reference/video/audio is connected
@@ -2468,6 +2689,9 @@ class _LLMRunner:
             if any(name == "refs" for name, _ in picture_counts) and self.chat_handler is not None:
                 log = _pictures_log(picture_counts)
                 print(f"[Luna-LLMPrompt] {log}")
+            if refs_media_log and self.chat_handler is not None:
+                log = f"{log}\n{refs_media_log}" if log else refs_media_log
+                print(f"[Luna-LLMPrompt] {refs_media_log}")
             if negative_dropped(result, split_output):
                 log = f"{log}\n{NEGATIVE_DROPPED_NOTE}" if log else NEGATIVE_DROPPED_NOTE
                 print(f"[Luna-LLMPrompt] {NEGATIVE_DROPPED_NOTE}")
@@ -2687,7 +2911,9 @@ class LLMPromptNode(io.ComfyNode):
                 io.Image.Input("image", optional=True, tooltip="Input image for vision analysis."),
                 io.Image.Input("reference_image", optional=True,
                                tooltip="Reference image for style-transfer prompts (the style source)."),
-                io.Image.Input("video", optional=True, tooltip="Video frames [F,H,W,3] for vision analysis."),
+                io.Image.Input("video", optional=True,
+                               tooltip="Video frames [F,H,W,3] for vision analysis, at `fps` frames per second "
+                                       "(unwired 24); video_fps of them per second of clip are sent."),
                 io.Audio.Input("audio", optional=True, tooltip="Audio input (Gemma-4 audio projector only)."),
                 io.Int.Input("frames", optional=True, force_input=True,
                              tooltip="The clip's real frame count, for `validate`. Lets S.SS and the cut times be checked against the actual duration instead of just their format."),
@@ -2701,10 +2927,18 @@ class LLMPromptNode(io.ComfyNode):
                 # Added last (S7): a socket-only input, so saved widget positions are unchanged.
                 io.Custom("LUNA_H3_REFS").Input(
                     "refs", optional=True,
-                    tooltip="Pictures to look at, each at its own size: wire Luna-ImageLoader `refs` or "
-                            "Luna-H3-AssetLoader `refs`. Each is sent after the image / reference_image / video "
-                            "media as 'Image N (role, WxH)' then the picture; vision_mp is the only shrink. "
-                            "Without a wired asset_brief, the brief in refs becomes the PICTURES block."),
+                    tooltip="Pictures, clips and sounds to look at and listen to: wire Luna-ImageLoader `refs` or "
+                            "Luna-H3-AssetLoader `refs`. Each picture is sent after the image / reference_image / "
+                            "video media as 'Image N (role, WxH)' then the picture, each at its own size; vision_mp "
+                            "is the only shrink. Each clip goes as 4 stills, first and last included, each after "
+                            "'Video K, frame F of N (WxH)'. Its sounds (clip sounds, sounds, song, vocal stem) go "
+                            "only to a model that takes sound (Gemma 4 with its projector); for any other the brief "
+                            "names no sound. Without a wired asset_brief, the brief in refs becomes the PICTURES "
+                            "block."),
+                # Added last (Build 2): a socket-only input, so saved widget positions are unchanged.
+                io.Float.Input("fps", optional=True, force_input=True,
+                               tooltip="The frame rate of the frames on `video`, so its length in seconds is right "
+                                       "for video_fps sampling. Unwired: 24."),
             ],
             outputs=[
                 io.String.Output("positive", display_name="positive"),
@@ -2719,12 +2953,23 @@ class LLMPromptNode(io.ComfyNode):
         call_kwargs = _filter_kwargs_for_callable(_LLMRunner.generate, kwargs)
         # The user's @ names: the PICTURES block shows the model the map in its preset's row (passed as the
         # asset_brief generate() already takes; it wins inside _refs_brief), and the outputs are replaced after.
+        # When this model takes no sound, a brief of a `refs` with sounds names none (generate() sends the refs
+        # sounds on the same answer, _gguf_refs_hearing).
+        refs = call_kwargs.get("refs")
+        # Encoded once, here: the brief is written for this result and generate() sends exactly these parts.
+        encoded_sounds, hears, hear_note = _gguf_refs_hearing(
+            call_kwargs.get("model_name"), call_kwargs.get("load_mmproj", "auto"), refs, call_kwargs.get("audio"))
+        call_kwargs["refs_sounds"] = encoded_sounds
         naming = _naming_prepare(
-            call_kwargs.get("asset_brief"), call_kwargs.get("refs"), call_kwargs.get("user_prompt"),
+            call_kwargs.get("asset_brief"), refs, call_kwargs.get("user_prompt"),
             _preset_row(call_kwargs.get("system_prompt"), call_kwargs.get("custom_system_prompt")),
-            _gguf_pictures_sent(call_kwargs.get("image"), call_kwargs.get("reference_image"), call_kwargs.get("refs")))
-        if naming["brief"]:
+            _gguf_pictures_sent(call_kwargs.get("image"), call_kwargs.get("reference_image"), refs),
+            hear=hears, notes=[hear_note])
+        if naming["brief"] is not None:
             call_kwargs["asset_brief"] = naming["brief"]
+        if naming["rebuilt"] and isinstance(refs, dict):
+            # An empty rebuilt brief must not fall back to the refs brief, which names the sounds.
+            call_kwargs["refs"] = dict(refs, brief=naming["brief"])
         with _RUNNER_LOCK:
             try:
                 positive, negative, log = _RUNNER.generate(**call_kwargs)

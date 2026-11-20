@@ -62,7 +62,7 @@ from PIL import Image
 
 from comfy_api.latest import io
 
-from . import luna_naming
+from .api_refs import at_replace, place_refs, refs_tip
 from .llm_prompt_api_node import _resolve_api_key, _comfyui_root
 from .luna_imaging.cost import OPENAI_OUT_TOKENS_1024, OPENAI_RATES, openai_cost_line
 from .luna_imaging.sizes import RESOLUTIONS, openai_size
@@ -252,7 +252,8 @@ class OpenAIImageNode(io.ComfyNode):
                     tooltip="What to generate, or how to edit the reference images. Point at a reference "
                             "with @image1, @image2 ...: N is its place among the images sent (slot order, a "
                             "batch expanded in place); it is sent as 'Image N'. One with no such image is sent "
-                            "as words, with a warning in the console."),
+                            "as words, with a warning in the console. With `refs` wired and its loader's @ names, "
+                            "@imageN is the loader's card N instead."),
                 io.Combo.Input(
                     "model", options=MODELS, default=MODELS[0],
                     tooltip="2.5-flare = fast default; 2.5-sunburst = precision "
@@ -342,6 +343,11 @@ class OpenAIImageNode(io.ComfyNode):
                                      "larger sizes take longer."),
                 io.Int.Input("max_retries", default=2, min=0, max=5,
                              tooltip="Retries on 5xx / network errors. A 400 is not retried."),
+                # Added last: a socket-only input, so saved widget positions are unchanged.
+                io.Custom("LUNA_H3_REFS").Input(
+                    "refs", optional=True,
+                    tooltip=refs_tip("the images sent", None) + " With a mask, the first wired "
+                            "reference stays first (the mask applies to it) and the refs pictures follow it."),
             ],
             outputs=[
                 io.Image.Output("image", tooltip="The render(s)."),
@@ -357,7 +363,7 @@ class OpenAIImageNode(io.ComfyNode):
                 quality="auto", background="auto", output_format="png",
                 output_compression=100, moderation="low", input_fidelity="auto",
                 prompt_rewriter="off", rewriter_effort="low",
-                width=0, height=0, timeout=600, max_retries=2) -> io.NodeOutput:
+                width=0, height=0, timeout=600, max_retries=2, refs=None) -> io.NodeOutput:
         key = _resolve_api_key("OpenAI", "")
         if not key:
             raise RuntimeError(
@@ -368,11 +374,15 @@ class OpenAIImageNode(io.ComfyNode):
             raise ValueError("Prompt is required.")
 
         notes: list[str] = []
-        refs = _collect_refs(reference_images)
-        # The user's @ names: @imageN is the N-th image sent (slot order, a batch expanded in place), as Image N.
-        prompt, warnings = luna_naming.replace(prompt, None, "cloud", {"image": len(refs)})
-        for w in warnings:
-            print(f"[Luna-GPTImage] {w}")
+        wired = _collect_refs(reference_images)
+        # The refs pictures go first, then the wired references (no cap: the 2.x API took 101). With a mask, the
+        # first wired reference stays first, because the mask is drawn for it and the API applies it to image 1.
+        base = wired[:1] if (mask is not None and wired) else []
+        listed, naming = place_refs("Luna-GPTImage", refs, wired[len(base):], None, before=len(base))
+        refs = base + listed
+        # The user's @ names: with the loader's naming, @imageN is its card N wherever it lands; else @imageN is the
+        # N-th image sent (slot order, a batch expanded in place). Sent as Image N.
+        prompt = at_replace("Luna-GPTImage", prompt, naming, "cloud", {"image": len(refs)})
         size = openai_size(model, aspect_ratio, resolution, width, height, notes)
 
         if quality in ("xhigh", "max") and not _is_25(model):

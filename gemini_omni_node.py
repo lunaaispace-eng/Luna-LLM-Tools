@@ -55,7 +55,7 @@ from PIL import Image
 
 from comfy_api.latest import io
 
-from . import luna_naming
+from .api_refs import at_replace, place_refs, refs_tip
 from .llm_prompt_api_node import _resolve_api_key, _comfyui_root
 
 _BASE = "https://generativelanguage.googleapis.com/v1beta"
@@ -225,7 +225,8 @@ class GeminiOmniVideoNode(io.ComfyNode):
                     tooltip="What to generate, or how to change the input video. Point at a reference "
                             "with @image1, @image2 ...: N is its place among the images sent (slot order, "
                             "at most 3); it is sent as 'Image N'. An @ name with no such image, or @video1 "
-                            "(this model has no clip tag), is sent as words, with a warning in the console."),
+                            "(this model has no clip tag), is sent as words, with a warning in the console. With "
+                            "`refs` wired and its loader's @ names, @imageN is the loader's card N instead."),
                 io.Combo.Input("model", options=OMNI_MODELS, default=OMNI_MODELS[0]),
                 io.Combo.Input(
                     "mode", options=MODES, default="generate",
@@ -269,6 +270,9 @@ class GeminiOmniVideoNode(io.ComfyNode):
                             "file download for 1080p/4k (Google advises file "
                             "delivery above ~4 MB)."),
                 io.Int.Input("timeout", default=600, min=60, max=1800, step=30),
+                # Added last: a socket-only input, so saved widget positions are unchanged.
+                io.Custom("LUNA_H3_REFS").Input(
+                    "refs", optional=True, tooltip=refs_tip("the reference images", MAX_REFS)),
             ],
             outputs=[
                 io.Video.Output("video", tooltip="The generated or edited clip."),
@@ -282,27 +286,27 @@ class GeminiOmniVideoNode(io.ComfyNode):
     @classmethod
     def execute(cls, prompt, model, mode, aspect_ratio, resolution, seed,
                 reference_images=None, video=None, previous_interaction_id="",
-                delivery="auto", timeout=600) -> io.NodeOutput:
+                delivery="auto", timeout=600, refs=None) -> io.NodeOutput:
         key = _resolve_api_key("Gemini", "")
         if not key:
             raise RuntimeError(
                 "No Gemini API key found. Set GEMINI_API_KEY or add it to "
                 f"{_comfyui_root() / '.env'} — it is never stored in the workflow.")
         prompt = (prompt or "").strip()
-        refs = _collect_refs(reference_images)
+        # The refs pictures first, then the wired ones, cut to MAX_REFS (the wired ones dropped first, a warning).
+        refs, naming = place_refs("Luna-GeminiOmniVideo", refs, _collect_refs(reference_images), MAX_REFS)
         notes = []
         if len(refs) > MAX_REFS:
             notes.append(f"{len(refs)} reference images connected; only the first "
                          f"{MAX_REFS} are sent")
             refs = refs[:MAX_REFS]
         prev_id = (previous_interaction_id or "").strip()
-        # The user's @ names, counted after the cut to MAX_REFS: @imageN is the N-th image sent, as Image N. The
+        # The user's @ names, counted after the cut to MAX_REFS: with the loader's naming, @imageN is its card N
+        # wherever it lands (a dropped one warns); else @imageN is the N-th image sent. Sent as Image N. The
         # uploaded clip of edit / extend counts as one clip; the cloud row has no clip tag, so @video1 warns.
         sends_clip = mode != "generate" and video is not None and not (prev_id and mode == "edit video")
-        prompt, warnings = luna_naming.replace(prompt, None, "cloud",
-                                               {"image": len(refs), "video": 1 if sends_clip else 0})
-        for w in warnings:
-            print(f"[Luna-GeminiOmniVideo] {w}")
+        prompt = at_replace("Luna-GeminiOmniVideo", prompt, naming, "cloud",
+                            {"image": len(refs), "video": 1 if sends_clip else 0})
         # Live 2026-10-04: stateful EXTEND is rejected — "Only user input is
         # allowed when video task is set." Stateful EDIT works (61 s at 360p).
         # So extend always needs the uploaded clip.

@@ -239,7 +239,8 @@ Optional inputs:
 | `audio` | Audio input for compatible Gemma-style models. |
 | `frames` | The clip's real frame count, used by `validate = h3`. |
 | `asset_brief` | The picture inventory from Luna-H3-AssetLoader or Luna-ImageLoader, sent as a `PICTURES` block. |
-| `refs` | Pictures from Luna-ImageLoader or Luna-H3-AssetLoader `refs`, each sent at its own shape after the label `Image N (role, WxH)`; `vision_mp` is the only shrink. Without a wired `asset_brief`, the brief inside `refs` becomes the `PICTURES` block. |
+| `refs` | The bundle from Luna-ImageLoader, Luna-H3-AssetLoader or Luna-H3-RefsOut. Pictures go each at its own shape after the label `Image N (role, WxH)`; `vision_mp` is the only shrink. Each clip goes as 4 stills, first and last included, after `Video K, frame F of N (WxH)`. Its sounds (each clip's sound, the standalone sounds, the song, the vocal stem) go only where the model takes audio (Gemma 4 with its projector); a refs song that is the same audio as the wired `audio` is not sent twice. Where the model takes no sound, or a sound fails to encode, no refs sound is sent and the brief names none. Without a wired `asset_brief`, the brief inside `refs` becomes the `PICTURES` block. |
+| `fps` | Optional socket, last: the frame rate of the `video` frames; unwired 24. |
 
 Outputs:
 
@@ -362,7 +363,9 @@ min_p, repeat_penalty, context_length, unload_after_run   (LM Studio)
 - Optional inputs: `style`, `context`, `width` / `height`, `image`, `video`, `audio`, `frames`, `asset_brief`, `refs`
   (same meaning as on the local node).
 - Every provider gets the `refs` labels: next to each picture where it takes text and pictures in turn, as an
-  attach-order list on Codex, and in the file names on Antigravity.
+  attach-order list on Codex, and in the file names on Antigravity. The clip stills go on every provider; the refs sounds only
+  on Gemini, Gemini (Vertex) and Gemini (Antigravity), not with a Gemma model. Elsewhere the brief names no sound and a
+  returned `@audioN` becomes words with a warning.
 
 - `gemini_thinking_level` applies to every Gemini 3 model.
 - `gemini_thinking_budget` only applied to Gemini 2.5, which no longer answers new users; it stays in saved workflows

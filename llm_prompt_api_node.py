@@ -40,6 +40,9 @@ from .llm_prompt_node import (
     _sample_video_frames,
     _resolve_model_settings,
     _refs_pictures,
+    _refs_stills,
+    _refs_sounds,
+    _sounds_too_long,
     _refs_brief,
     _pictures_log,
     _preset_row,
@@ -1484,13 +1487,18 @@ def _send_gemini_native(
             contents.append(types.Content(role=gemini_role, parts=parts))
 
     # Audio clips (WAV) ride inline with the user turn. TESTED 2026-10-12:
-    # gemini-3.8-flash quoted a spoken test sentence exactly.
+    # gemini-3.8-flash quoted a spoken test sentence exactly. A (label, WAV) entry
+    # (a `refs` sound) goes right after a text part with its label.
     for clip in audio or []:
-        part = types.Part(inline_data=types.Blob(mime_type="audio/wav", data=clip))
+        label = None
+        if isinstance(clip, (list, tuple)):
+            label, clip = clip
+        new = ([types.Part(text=label)] if label else []) + [
+            types.Part(inline_data=types.Blob(mime_type="audio/wav", data=clip))]
         if contents and contents[-1].role == "user":
-            contents[-1].parts.append(part)
+            contents[-1].parts.extend(new)
         else:
-            contents.append(types.Content(role="user", parts=[part]))
+            contents.append(types.Content(role="user", parts=new))
 
     # Build the SDK config — match Luna Core's simple pattern
     config_kwargs: dict[str, Any] = {}
@@ -1846,8 +1854,9 @@ def _build_multimodal_user_content(text: str, images_b64: list[str],
 # Subscription CLI routes (Claude Max / Codex ChatGPT / SuperGrok)
 # ---------------------------------------------------------------------------
 
-# A picture label from _refs_pictures: "Image N (role, WxH)" or "Image N (WxH)".
-_IMAGE_LABEL_RE = re.compile(r"^Image \d+ \([^()\n]*\)$")
+# A picture label from _refs_pictures: "Image N (role, WxH)" or "Image N (WxH)"; a clip still's from _refs_stills:
+# "Video K, frame F of N (WxH)".
+_IMAGE_LABEL_RE = re.compile(r"^(?:Image \d+|Video \d+, frame \d+ of \d+) \([^()\n]*\)$")
 
 
 def _cli_parts(messages: list[dict]) -> tuple[str, list[str], list[tuple[str, str]]]:
@@ -2109,9 +2118,11 @@ def _send_grok_cli(model: str, messages: list[dict], timeout: float, reasoning_e
 
 
 def _send_agy_cli(model: str, messages: list[dict], timeout: float, reasoning_effort: str,
-                  audio: list[tuple[bytes, str]] | None = None) -> str:
+                  audio: list[tuple] | None = None) -> str:
     """Antigravity CLI (`agy`) headless on the Gemini login. TESTED 2026-10-12: it reads
-    prompt.md, looks at the images and listens to the audio in its folder, in plan mode."""
+    prompt.md, looks at the images and listens to the audio in its folder, in plan mode.
+    audio: (WAV bytes, extension) or (WAV bytes, extension, label) entries; a labelled one is
+    named with its label in the attached-files line, as a labelled image is."""
     import base64 as _b64
     exe = _cli_exe("agy", [r"D:\CLI-Data\agy\agy.exe"])
     system, texts, pictures = _cli_parts(messages)
@@ -2130,9 +2141,11 @@ def _send_agy_cli(model: str, messages: list[dict], timeout: float, reasoning_ef
         for i, (label, b) in enumerate(pictures):
             (Path(wd) / f"image_{i:02d}.png").write_bytes(_b64.b64decode(b))
             names.append(f"image_{i:02d}.png = {label}" if label else f"image_{i:02d}.png")
-        for i, (data, ext) in enumerate(audio or []):
+        for i, entry in enumerate(audio or []):
+            data, ext = entry[0], entry[1]
+            label = entry[2] if len(entry) > 2 else ""
             (Path(wd) / f"audio_{i:02d}.{ext}").write_bytes(data)
-            names.append(f"audio_{i:02d}.{ext}")
+            names.append(f"audio_{i:02d}.{ext} = {label}" if label else f"audio_{i:02d}.{ext}")
         body = text or "Describe a scene vividly."
         if system:
             body = f"SYSTEM INSTRUCTIONS:\n{system}\n\n---\n\n{body}"
@@ -2253,6 +2266,47 @@ AUDIO_PROTOCOLS = ("gemini", "agy_cli")
 _AUDIO_MAX_SECONDS = 15 * 60  # Gemini's limit for all audio in one prompt
 
 
+def _api_takes_audio(provider: str, model_name: str) -> bool:
+    """The route takes sound: its protocol is in AUDIO_PROTOCOLS and the model is no Gemma (write_prompt_api
+    refuses audio otherwise)."""
+    cfg = PROVIDERS.get(provider) or {}
+    return cfg.get("native_protocol") in AUDIO_PROTOCOLS and "gemma" not in (model_name or "").lower()
+
+
+def _refs_sounds_encode_note(sounds) -> str:
+    """"" when every (label, AUDIO) refs sound encodes to WAV (_audio_to_wav), else one ASCII line naming the first
+    that does not. The node checks this before it writes the brief, so a sound that cannot be sent is never named:
+    one failure sends none of them (as a sound over the length limit does)."""
+    for label, a in sounds:
+        try:
+            ok = bool(_audio_to_wav(a))
+        except Exception as e:
+            reason = str(e).encode("ascii", "replace").decode("ascii")
+            return (f"The refs sounds are not sent: {label.split(' (')[0]} could not be encoded "
+                    f"({type(e).__name__}: {reason}); the brief names no sound.")
+        if not ok:
+            return (f"The refs sounds are not sent: {label.split(' (')[0]} could not be encoded (no samples); "
+                    f"the brief names no sound.")
+    return ""
+
+
+def _audio_parts(audio) -> list:
+    """write_prompt_api's `audio` -> the senders' audio list, in order.
+
+    `audio` is a ComfyUI AUDIO dict (the node's `audio` input, as always), or a list of AUDIO dicts and
+    (label, AUDIO dict) pairs (the node adds the `refs` sounds this way, each with its label). An unlabelled
+    sound gives its WAV bytes per batch item, as before; a labelled one gives (label, WAV bytes)."""
+    if isinstance(audio, (list, tuple)):
+        out = []
+        for item in audio:
+            if isinstance(item, (list, tuple)) and len(item) == 2 and isinstance(item[0], str):
+                out += [(item[0], b) for b in _audio_to_wav(item[1])]
+            else:
+                out += _audio_to_wav(item)
+        return out
+    return _audio_to_wav(audio)
+
+
 def _audio_to_wav(audio) -> list[bytes]:
     """A ComfyUI AUDIO dict ({"waveform": [B, C, T], "sample_rate"}) -> 16-bit WAV per batch item."""
     if not audio or not isinstance(audio, dict) or audio.get("waveform") is None:
@@ -2359,16 +2413,18 @@ def write_prompt_api(
     node. quality: a level from QUALITY_OPTIONS sets the reasoning level over the widgets;
     "custom" (the default here, so luna_writer_api callers are unchanged) keeps them.
     Figures of the run land in _run_stats() for the node face. min_p, repeat_penalty,
-    context_length and unload_after_run are LM Studio's. audio: a ComfyUI AUDIO dict, for the
-    routes in AUDIO_PROTOCOLS only. labelled_images: (label, base64 PNG) pairs (the node's
-    `refs` pictures), sent after images_b64, each right after its label where the route
-    allows text between images, else with the labels listed in attach order.
+    context_length and unload_after_run are LM Studio's. audio: a ComfyUI AUDIO dict, or a list
+    of AUDIO dicts and (label, AUDIO dict) pairs (_audio_parts; the node's `refs` sounds, each
+    sent right after its label), for the routes in AUDIO_PROTOCOLS only. labelled_images:
+    (label, base64 PNG) pairs (the node's `refs` pictures and clip stills), sent after images_b64,
+    each right after its label where the route allows text between images, else with the
+    labels listed in attach order.
     """
     cfg, native_video = _video_route(provider, model_name, video, video_input_mode)
     if video is not None and not native_video:
         raise ValueError("write_prompt_api takes `video` only for native Gemini; "
                          "send sampled frames as images_b64 instead.")
-    audio_clips = _audio_to_wav(audio)
+    audio_clips = _audio_parts(audio)
     if audio_clips and cfg.get("native_protocol") not in AUDIO_PROTOCOLS:
         raise ValueError(
             f"{provider} cannot take audio. Audio input works with Gemini and Gemini (Antigravity) "
@@ -2591,7 +2647,8 @@ def write_prompt_api(
         raw = _send(model_name, messages, float(timeout_seconds), reasoning_effort)
     elif _cli == "agy_cli":
         raw = _send_agy_cli(model_name, messages, float(timeout_seconds), reasoning_effort,
-                            audio=[(b, "wav") for b in audio_clips])
+                            audio=[(b, "wav") if isinstance(b, bytes) else (b[1], "wav", b[0])
+                                   for b in audio_clips])
     elif _cli == "lmstudio":
         raw = _send_lmstudio(
             base_url=base_url, api_key=resolved_key, model=model_name, messages=messages,
@@ -2853,9 +2910,13 @@ class LLMPromptAPINode(io.ComfyNode):
                 # Added last (S7): a socket-only input, so saved widget positions are unchanged.
                 io.Custom("LUNA_H3_REFS").Input(
                     "refs", optional=True,
-                    tooltip="Pictures to look at, each at its own size: wire Luna-ImageLoader `refs` or "
-                            "Luna-H3-AssetLoader `refs`. Each is sent after the image and video media as "
-                            "'Image N (role, WxH)' then the picture; vision_mp is the only shrink. Without a "
+                    tooltip="Pictures, clips and sounds to look at and listen to: wire Luna-ImageLoader `refs` or "
+                            "Luna-H3-AssetLoader `refs`. Each picture is sent after the image and video media as "
+                            "'Image N (role, WxH)' then the picture, each at its own size; vision_mp is the only "
+                            "shrink. Each clip goes as 4 stills, first and last included, each after 'Video K, "
+                            "frame F of N (WxH)', on every route that takes pictures. Its sounds (clip sounds, "
+                            "sounds, song, vocal stem) go only on routes that take audio (Gemini, Gemini (Vertex) "
+                            "and Gemini (Antigravity), no Gemma); on the others the brief names no sound. Without a "
                             "wired asset_brief, the brief in refs becomes the PICTURES block."),
             ],
             outputs=[
@@ -2963,16 +3024,42 @@ class LLMPromptAPINode(io.ComfyNode):
         labelled_images = [(label, _tensor_to_base64_png(frame, max_mp=vision_mp))
                            for label, frame in _refs_pictures(refs)]
         labelled_images = [(label, b) for label, b in labelled_images if b]
+        n_refs_pictures = len(labelled_images)
         pictures_log = ""
         if labelled_images:
             pictures_log = _pictures_log([("image", n_image), ("video", len(images_b64) - n_image),
                                           ("refs", len(labelled_images))])
+        # The clips in `refs` as stills, after its pictures, each after its "Video K, frame F of N" label.
+        stills = [(label, _tensor_to_base64_png(frame, max_mp=vision_mp)) for label, frame in _refs_stills(refs)]
+        stills = [(label, b) for label, b in stills if b]
+        labelled_images += stills
+
+        # The sounds in `refs`, each after its label, on a route that takes audio only (the same check as the
+        # `audio` input: AUDIO_PROTOCOLS, no Gemma). The refs song is left out when it is the wired `audio` itself.
+        ref_sounds, hears, hear_note = _refs_sounds(refs, audio), True, ""
+        if _refs_sounds(refs):
+            hears = _api_takes_audio(provider, model_name)
+            if hears:
+                hear_note = _sounds_too_long(ref_sounds, _AUDIO_MAX_SECONDS) or _refs_sounds_encode_note(ref_sounds)
+                hears = not hear_note
+            if not hears:
+                ref_sounds = []
+        else:
+            ref_sounds = []
+        send_audio = audio
+        if ref_sounds:
+            send_audio = ([audio] if audio is not None else []) + list(ref_sounds)
+        refs_media_log = ""
+        if stills or ref_sounds:
+            refs_media_log = (f"From refs: {len(stills)} still(s) of {len({lab.split(',')[0] for lab, _ in stills})} "
+                              f"clip(s), {len(ref_sounds)} sound(s).")
 
         # The user's @ names. Pictures sent, in order: the `image` frames, then the `refs` pictures (the sampled
         # video frames between them are a clip, not pictures). The PICTURES text with the map in the preset's row
-        # goes in as the core's asset_brief; positive / negative are replaced after.
+        # goes in as the core's asset_brief; positive / negative are replaced after. A route that hears no refs
+        # sound gets a brief that names none.
         naming = _naming_prepare(asset_brief, refs, user_prompt, _preset_row(system_prompt, custom_system_prompt),
-                                 n_image + len(labelled_images))
+                                 n_image + n_refs_pictures, hear=hears, notes=[hear_note])
 
         try:
             positive, negative, log = write_prompt_api(
@@ -2990,15 +3077,16 @@ class LLMPromptAPINode(io.ComfyNode):
                 video=video if native_video else None, video_input_mode=video_input_mode,
                 video_sample_frames=video_sample_frames, gemini_video_fps=gemini_video_fps,
                 quality=quality, min_p=min_p, repeat_penalty=repeat_penalty,
-                context_length=context_length, unload_after_run=unload_after_run, audio=audio,
-                asset_brief=naming["brief"] or _refs_brief(asset_brief, refs), labelled_images=labelled_images,
+                context_length=context_length, unload_after_run=unload_after_run, audio=send_audio,
+                asset_brief=naming["brief"] if naming["brief"] is not None else _refs_brief(asset_brief, refs),
+                labelled_images=labelled_images,
             )
         except age_guard.AgeGuardError as exc:
             # Skip only what this prompt feeds; the rest of the graph and the queue run on.
             return io.NodeOutput(*age_guard.blocked_outputs(str(exc)))
         # Sampled frames and refs pictures are this node's work, so their log lines are
         # added here, ahead of the validation report, as before.
-        head = [line for line in (pictures_log, sampled_log) if line]
+        head = [line for line in (pictures_log, refs_media_log, sampled_log) if line]
         for line in head:
             print(f"[Luna-LLMPromptAPI] {line}")
         if head:
