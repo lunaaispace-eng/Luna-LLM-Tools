@@ -168,7 +168,7 @@ All settings (the ones not on the face are in the ⚙ panel):
 | `model_name` | Local `.gguf` model from `models/LLM`. |
 | `system_prompt` | Preset loaded from `prompts/*.md`. |
 | `custom_system_prompt` | Overrides the selected preset when non-empty. |
-| `user_prompt` | The idea, subject, or request to transform. |
+| `user_prompt` | The idea, subject, or request to transform. It may point at pictures as `@image1`, `@image2`… (see [@ names](#-names)). |
 | `output_format` | `text`, `json`, or `list`. |
 | `split_output` | Splits model output into `positive` and `negative`. |
 | `auto_settings` | Applies recommended sampling and thinking controls for known model families. |
@@ -532,6 +532,8 @@ Per-model limits (checked against the live API, 2026-10-04):
 - `Grok Reference-to-Video`: `voice_1..3` pick from xAI's 26 preset voices (or
   `custom_voice_ids`), referenced in the prompt as `<AUDIO_0>`…; images are `<IMAGE_0>`…; an
   optional `first_frame` is pinned as `<IMAGE_0>`.
+- Every Grok node turns `@image1`, `@image2`… in its prompt into `<IMAGE_0>`, `<IMAGE_1>`… in the order it sends
+  the images (each node's `prompt` tooltip states it); see [@ names](#-names).
 - Video nodes have `generate_audio` (off strips the audio track). The console prints each job's
   cost from xAI's `cost_in_usd_ticks`. `seed` is not an xAI field; it only re-runs the node.
 
@@ -550,12 +552,17 @@ Each file can include YAML frontmatter:
 ```markdown
 ---
 title: My Preset Name
+labels: minimax
 ---
 
 System prompt text...
 ```
 
 If no title is provided, the filename is converted into a display label.
+
+`labels:` is optional: the tags the preset writes for pictures, clips and sounds — `minimax` (`<Picture N>`,
+`<Video N>`, `<Audio N>`), `qwen` (`<imageN>`), `cloud` (`Image N`) or `grok` (`<IMAGE_n>`). The 7 `MinimaxH3_*`
+presets carry `minimax` and `Qwen_Image_2.1_Edit.md` carries `qwen`; see [@ names](#-names).
 
 Current preset files:
 
@@ -603,6 +610,25 @@ tags.md
   explicit. A typo such as "a 17 year old woman" for 27 is stopped there: correct the age and run again.
 - A stopped node does not fail the run: the nodes its `positive` and `negative` feed are skipped, the rest of the graph
   and the queue go on, and `log` says why. The negative prompt is not checked. There is no switch to turn it off.
+
+## @ names
+
+- Point at a picture, clip or sound in a prompt with `@image1`, `@video1`, `@audio1`. With Luna-H3-AssetLoader or
+  Luna-ImageLoader wired in, the number is the card number shown on the loader; anywhere else it is the item's place
+  among what the node sends. Nothing happens to a prompt without them.
+- No @ name reaches a model: each one becomes the tag of the model the prompt goes to — `<Picture N>` / `<Video N>` /
+  `<Audio N>` (MiniMax), `<imageN>` (Qwen-Image 2.1), `Image N` (GPT Image, Gemini), `<IMAGE_n>` from 0 (Grok).
+- An @ name with no such item (or an item that is not sent, or a kind the model takes no tag for) is written as
+  words ("the picture", "the clip", "the sound") and warns.
+- **The writers** (`Luna-LLMPrompt`, `Luna-LLMPromptAPI`): the `PICTURES` block carries an `@ names:` line
+  (`@image1 = <Picture 2>; …`) in the chosen preset's tags. The line comes from the brief (Luna-H3-RefsOut's brief
+  carries it after its switches), else from `refs`, else, when `user_prompt` holds an @ name, from the pictures the
+  writer sends: `image` frames, `reference_image` (local node), then the `refs` pictures. Your `user_prompt` is sent as
+  typed. Every @ name left in `positive` or `negative` is replaced with that tag. `log` lists each warning once, and a
+  line when the preset's tags differ from the loader's ⚙ Target.
+- **The image and video nodes** (`Luna-GPTImage`, `Luna-GeminiImage`, `Luna-GeminiOmniVideo`, the seven Grok nodes)
+  replace the @ names in their own `prompt` before sending it, counting the images they really send (Omni: after its
+  cut to 3). The warnings go to the console with the node id.
 
 ## Positive / Negative Split
 

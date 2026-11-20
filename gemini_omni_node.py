@@ -55,6 +55,7 @@ from PIL import Image
 
 from comfy_api.latest import io
 
+from . import luna_naming
 from .llm_prompt_api_node import _resolve_api_key, _comfyui_root
 
 _BASE = "https://generativelanguage.googleapis.com/v1beta"
@@ -221,7 +222,10 @@ class GeminiOmniVideoNode(io.ComfyNode):
             inputs=[
                 io.String.Input(
                     "prompt", multiline=True, default="",
-                    tooltip="What to generate, or how to change the input video."),
+                    tooltip="What to generate, or how to change the input video. Point at a reference "
+                            "with @image1, @image2 ...: N is its place among the images sent (slot order, "
+                            "at most 3); it is sent as 'Image N'. An @ name with no such image, or @video1 "
+                            "(this model has no clip tag), is sent as words, with a warning in the console."),
                 io.Combo.Input("model", options=OMNI_MODELS, default=OMNI_MODELS[0]),
                 io.Combo.Input(
                     "mode", options=MODES, default="generate",
@@ -292,6 +296,13 @@ class GeminiOmniVideoNode(io.ComfyNode):
                          f"{MAX_REFS} are sent")
             refs = refs[:MAX_REFS]
         prev_id = (previous_interaction_id or "").strip()
+        # The user's @ names, counted after the cut to MAX_REFS: @imageN is the N-th image sent, as Image N. The
+        # uploaded clip of edit / extend counts as one clip; the cloud row has no clip tag, so @video1 warns.
+        sends_clip = mode != "generate" and video is not None and not (prev_id and mode == "edit video")
+        prompt, warnings = luna_naming.replace(prompt, None, "cloud",
+                                               {"image": len(refs), "video": 1 if sends_clip else 0})
+        for w in warnings:
+            print(f"[Luna-GeminiOmniVideo] {w}")
         # Live 2026-10-04: stateful EXTEND is rejected — "Only user input is
         # allowed when video task is set." Stateful EDIT works (61 s at 360p).
         # So extend always needs the uploaded clip.

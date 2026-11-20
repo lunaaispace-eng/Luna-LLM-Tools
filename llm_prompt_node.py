@@ -49,6 +49,7 @@ from comfy_api.latest import io
 
 # Bundled output cleaner â€” no external dependencies
 from . import age_guard
+from . import luna_naming
 from .output_cleaner import (
     OutputCleanConfig, clean_model_output, normalize_prompt_separator, split_positive_negative, strip_code_fence_lines,
     negative_dropped, NEGATIVE_DROPPED_NOTE,
@@ -241,11 +242,16 @@ def load_system_prompts() -> dict[str, str]:
 
     prompts/private/ is not read (excluded 2026-11-16, `SPEC.md` § 1).
     """
-    prompts = {}
+    return {title: content for title, content, _meta in _read_presets()}
+
+
+def _read_presets():
+    """(title, text without the frontmatter, frontmatter dict or {}) for each preset with text, in file order."""
     if not PROMPTS_DIR.exists():
         PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
-        return prompts
+        return []
 
+    out = []
     for md_file in sorted(PROMPTS_DIR.glob("*.md")):
         try:
             text = md_file.read_text(encoding="utf-8").strip()
@@ -257,22 +263,35 @@ def load_system_prompts() -> dict[str, str]:
 
         title = md_file.stem.replace("_", " ").title()
         content = text
+        meta = {}
 
         match = re.match(r"^---\s*\n(.*?)\n---\s*\n(.*)$", text, re.DOTALL)
         if match:
             try:
                 import yaml
-                meta = yaml.safe_load(match.group(1))
-                if isinstance(meta, dict):
+                loaded = yaml.safe_load(match.group(1))
+                if isinstance(loaded, dict):
+                    meta = loaded
                     title = meta.get("title", title)
                 content = match.group(2).strip()
             except Exception:
                 content = text
 
         if content:
-            prompts[title] = content
+            out.append((title, content, meta))
 
-    return prompts
+    return out
+
+
+def load_preset_rows() -> dict[str, str]:
+    """Preset title -> the naming row its tags are written in (`luna_naming.ROWS`), from the frontmatter key
+    `labels:` (e.g. `labels: minimax`). A preset without the key, or with a value that names no row, is absent."""
+    rows = {}
+    for title, _content, meta in _read_presets():
+        row = luna_naming.row_for(meta.get("labels"))
+        if row:
+            rows[title] = row
+    return rows
 
 
 SYSTEM_PROMPTS = load_system_prompts()
@@ -641,6 +660,71 @@ def _refs_brief(asset_brief, refs) -> str:
 def _pictures_log(counts: list[tuple[str, int]]) -> str:
     """One log line naming how many pictures each input sent, e.g. "Pictures: 1 from image, 3 from refs."."""
     return "Pictures: " + ", ".join(f"{n} from {name}" for name, n in counts if n) + "."
+
+
+# ---------------------------------------------------------------------------
+# The user's @ names (@image1, @video1, @audio1) in both writers
+# ---------------------------------------------------------------------------
+# Rule: Luna-LLM-Tools SPEC § 2 ("Naming follows the shared table") and Luna-MinimaxH3 SPEC § 2, Naming. Both nodes'
+# execute() run _naming_prepare before their writer core and _naming_finish after it; the cores (generate,
+# write_prompt_api) and luna_writer_api's calls into them are unchanged.
+
+def _preset_row(system_prompt, custom_system_prompt) -> str | None:
+    """The row the chosen preset writes its tags in, or None (no `labels:`, "None", or custom instructions in use)."""
+    if custom_system_prompt and str(custom_system_prompt).strip():
+        return None
+    return load_preset_rows().get(system_prompt)
+
+
+def _naming_prepare(asset_brief, refs, user_prompt, preset_row, n_pictures: int) -> dict:
+    """What a writer shows its model about the @ names, and what it replaces with afterwards.
+
+    PICTURES text = _refs_brief(asset_brief, refs). Naming = the names line in that text, else refs["naming"]
+    (luna_naming.pick); with neither and an @ token in the request, one made for the n_pictures the writer sends,
+    numbered in the order it sends them. Row = the preset's row, else the naming's, else cloud.
+    Returns {"brief": the PICTURES text for the core (None = pass asset_brief on unchanged), "naming", "row",
+    "mismatch": the preset/loader row warning or "", "warnings": the request's @ names with no item}."""
+    text = _refs_brief(asset_brief, refs)
+    naming = luna_naming.pick(text, refs)
+    if naming is None and luna_naming.replace(user_prompt or "")[1]:
+        naming = luna_naming.make(preset_row or "cloud", ["ref"] * max(int(n_pictures), 0))
+    row = preset_row or (naming or {}).get("row") or "cloud"
+    state = {"brief": None, "naming": naming, "row": row, "warnings": [],
+             "mismatch": luna_naming.mismatch(preset_row, (naming or {}).get("row"))}
+    if naming is not None:
+        state["brief"] = luna_naming.put_names_line(text, naming, row)
+        # The request is sent as typed; its @ names are only checked, so one with no item warns even when the
+        # model writes words for it.
+        state["warnings"] = luna_naming.replace(user_prompt or "", naming, row)[1]
+    return state
+
+
+def _naming_finish(state: dict, positive: str, negative: str, log: str, who: str):
+    """positive / negative with every @ name replaced by the naming's tag in its row (or words), and the log with
+    the mismatch line and each warning once, ahead of what the core wrote. Nothing to say: log unchanged."""
+    naming, row = state["naming"], state["row"]
+    positive, w_pos = luna_naming.replace(positive or "", naming, row)
+    negative, w_neg = luna_naming.replace(negative or "", naming, row)
+    lines = [state["mismatch"]] if state["mismatch"] else []
+    for w in state["warnings"] + w_pos + w_neg:
+        if w not in lines:
+            lines.append(w)
+    for line in lines:
+        print(f"[{who}] {line}")
+    if lines:
+        log = "\n".join(lines + ([log] if log else []))
+    return positive, negative, log
+
+
+def _gguf_pictures_sent(image=None, reference_image=None, refs=None) -> int:
+    """How many pictures Luna-LLMPrompt sends, as generate() assembles them: every frame of `image`, then
+    `reference_image` (one frame), then the `refs` pictures. Video frames are a clip, not pictures."""
+    n = 0
+    if image is not None:
+        n += int(image.shape[0]) if getattr(image, "ndim", 0) == 4 else 1
+    if reference_image is not None:
+        n += 1
+    return n + len(_refs_pictures(refs))
 
 
 def _pick_device(device_choice: str) -> str:
@@ -2463,7 +2547,13 @@ class LLMPromptNode(io.ComfyNode):
                                 tooltip="Optional - your own instructions; overrides the preset above. "
                                         "Leave empty to use the preset."),
                 io.String.Input("user_prompt", multiline=True, default="",
-                                tooltip="Your idea or subject. This is what the model turns into a finished prompt."),
+                                tooltip="Your idea or subject. This is what the model turns into a finished prompt. "
+                                        "Point at a picture with @image1, @image2 ... (@video1, @audio1 for clips and "
+                                        "sounds): N is the card number on Luna-H3-AssetLoader or Luna-ImageLoader, else "
+                                        "the place the picture is sent here (image frames, reference_image, then refs). "
+                                        "The PICTURES block shows the model each name's tag; an @ name left in positive "
+                                        "or negative is replaced by that tag, and one with no such picture becomes words "
+                                        "and a warning on log."),
                 io.Combo.Input("output_format", options=["text", "json", "list"], default="text",
                                tooltip="text = one finished prompt (normal). json = structured data. "
                                        "list = numbered scenes for multi-shot video."),
@@ -2603,9 +2693,11 @@ class LLMPromptNode(io.ComfyNode):
                              tooltip="The clip's real frame count, for `validate`. Lets S.SS and the cut times be checked against the actual duration instead of just their format."),
                 # Added last (2026-11-16): a socket-only input, so saved widget positions are unchanged.
                 io.String.Input("asset_brief", optional=True, force_input=True,
-                                tooltip="The asset_brief from Luna-H3-AssetLoader: one line naming each wired picture as <Picture N> with its true "
-                                        "size and ratio. Sent as a PICTURES block, so a prompt writer knows which picture is which "
-                                        "and each one's real shape even when the images batch is letterboxed."),
+                                tooltip="The asset_brief from Luna-H3-AssetLoader, Luna-H3-RefsOut or Luna-ImageLoader: each wired picture with "
+                                        "its tag, true size and ratio, and the '@ names:' line mapping each @imageN / @videoN / @audioN to "
+                                        "its tag. Sent as a PICTURES block, with that line written in the preset's tags, so a prompt "
+                                        "writer knows which picture is which and each one's real shape even when the images batch is "
+                                        "letterboxed."),
                 # Added last (S7): a socket-only input, so saved widget positions are unchanged.
                 io.Custom("LUNA_H3_REFS").Input(
                     "refs", optional=True,
@@ -2625,6 +2717,14 @@ class LLMPromptNode(io.ComfyNode):
     def execute(cls, **kwargs) -> io.NodeOutput:
         # Drop any framework-injected extras the runner doesn't expect, then run.
         call_kwargs = _filter_kwargs_for_callable(_LLMRunner.generate, kwargs)
+        # The user's @ names: the PICTURES block shows the model the map in its preset's row (passed as the
+        # asset_brief generate() already takes; it wins inside _refs_brief), and the outputs are replaced after.
+        naming = _naming_prepare(
+            call_kwargs.get("asset_brief"), call_kwargs.get("refs"), call_kwargs.get("user_prompt"),
+            _preset_row(call_kwargs.get("system_prompt"), call_kwargs.get("custom_system_prompt")),
+            _gguf_pictures_sent(call_kwargs.get("image"), call_kwargs.get("reference_image"), call_kwargs.get("refs")))
+        if naming["brief"]:
+            call_kwargs["asset_brief"] = naming["brief"]
         with _RUNNER_LOCK:
             try:
                 positive, negative, log = _RUNNER.generate(**call_kwargs)
@@ -2633,6 +2733,7 @@ class LLMPromptNode(io.ComfyNode):
                 return io.NodeOutput(*age_guard.blocked_outputs(str(exc)))
             stats = dict(getattr(_RUNNER, "last_stats", {}) or {})
             reasoning = getattr(_RUNNER, "last_reasoning", "") or ""
+        positive, negative, log = _naming_finish(naming, positive, negative, log, "Luna-LLMPrompt")
         # The node face reads these in onExecuted: the last-run line and its
         # "view thinking" link (the same reasoning the `log` output carries).
         ui = {"llm_stats": [stats]} if stats else {}

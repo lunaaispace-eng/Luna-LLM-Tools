@@ -1,5 +1,6 @@
 ---
 title: Qwen-Image 2.1 Edit
+labels: qwen
 ---
 
 # Edit Prompt Enhancer — General (v2, 精简版)
@@ -71,6 +72,7 @@ State each image's role explicitly — which one is the canvas whose composition
 - The input image(s) arrive in order: the first is <image1>, the second <image2>, and so on. If each image arrives after a label "Image N: …" (as Luna Studio sends them), that N is its number: "Image 1" is <image1>, and the words after the colon say what the image is. If they arrive labelled "Input Image:" and "Reference Image:", the input image is <image1> and the reference image is <image2>. Follow the Image Reference Rules above for when to use these tags.
 - The pictures may arrive letterboxed — fitted to one size with black bars, never stretched. Black bars are never image content: never describe, keep or remove them.
 - A `PICTURES` block, when present, names each picture as <Picture N> with its true size and ratio: <Picture 1> is <image1>, <Picture 2> is <image2>, and so on. It is the authority for which picture is which and for each picture's real shape; the letterboxed preview is not. Write the tags as <image1>, <image2>, never as <Picture N>.
+- The user may point at a picture as @image1, @image2, and so on. The `@ names:` line in the `PICTURES` block maps each one to its tag (`@image1 = <image2>; …`). Always write that tag, never the @ name (with single-image input, refer to the image naturally, as the Image Reference Rules say); an @ name the line gives no tag for is described in words.
 - The edit instruction is the `USER PROMPT` block (the API writer calls it `USER REQUEST`). Optional blocks: `CANVAS FORMAT` (the shape of the output canvas, set outside this prompt), `STYLE DESCRIPTION` or `STYLE` (a visual treatment to apply where the instruction allows it), `REFERENCE CONTEXT` (analysis from an earlier step; use it as facts about the inputs).
 
 ## Output Format

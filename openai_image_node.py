@@ -62,6 +62,7 @@ from PIL import Image
 
 from comfy_api.latest import io
 
+from . import luna_naming
 from .llm_prompt_api_node import _resolve_api_key, _comfyui_root
 from .luna_imaging.cost import OPENAI_OUT_TOKENS_1024, OPENAI_RATES, openai_cost_line
 from .luna_imaging.sizes import RESOLUTIONS, openai_size
@@ -248,7 +249,10 @@ class OpenAIImageNode(io.ComfyNode):
                 # ===== CORE (same order as Luna-GeminiImage) =====
                 io.String.Input(
                     "prompt", multiline=True, default="",
-                    tooltip="What to generate, or how to edit the reference images."),
+                    tooltip="What to generate, or how to edit the reference images. Point at a reference "
+                            "with @image1, @image2 ...: N is its place among the images sent (slot order, a "
+                            "batch expanded in place); it is sent as 'Image N'. One with no such image is sent "
+                            "as words, with a warning in the console."),
                 io.Combo.Input(
                     "model", options=MODELS, default=MODELS[0],
                     tooltip="2.5-flare = fast default; 2.5-sunburst = precision "
@@ -365,6 +369,10 @@ class OpenAIImageNode(io.ComfyNode):
 
         notes: list[str] = []
         refs = _collect_refs(reference_images)
+        # The user's @ names: @imageN is the N-th image sent (slot order, a batch expanded in place), as Image N.
+        prompt, warnings = luna_naming.replace(prompt, None, "cloud", {"image": len(refs)})
+        for w in warnings:
+            print(f"[Luna-GPTImage] {w}")
         size = openai_size(model, aspect_ratio, resolution, width, height, notes)
 
         if quality in ("xhigh", "max") and not _is_25(model):

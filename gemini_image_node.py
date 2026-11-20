@@ -54,6 +54,7 @@ from comfy_api.latest import io
 # Same key resolver the Luna-LLMPromptAPI node uses — env var, then
 # <ComfyUI root>/.env, then <node folder>/.env. Keys never touch the workflow.
 from .llm_prompt_api_node import _resolve_api_key, _comfyui_root
+from . import luna_naming
 
 # ---------------------------------------------------------------------------
 # Static option sets (verified against google-genai 2.7.0 types.ImageConfig
@@ -372,7 +373,10 @@ class GeminiImageNode(io.ComfyNode):
                 io.String.Input(
                     "prompt", multiline=True, default="",
                     tooltip="What to generate, or how to edit the reference images. "
-                            "Wire the text output of Luna-LLMPromptAPI straight in here."),
+                            "Wire the positive output of Luna-LLMPromptAPI straight in here. Point at a "
+                            "reference with @image1, @image2 ...: N is its place among the images sent "
+                            "(slot order, a batch expanded in place); it is sent as 'Image N'. One with "
+                            "no such image is sent as words, with a warning in the console."),
                 io.Combo.Input(
                     "model", options=model_options, default="auto",
                     tooltip="Live list from ListModels on your key, cached 24h. "
@@ -632,6 +636,11 @@ class GeminiImageNode(io.ComfyNode):
         caps = _caps_for(model)
 
         refs = _collect_refs(reference_images, reference_images_2)
+        # The user's @ names: @imageN is the N-th image sent (the grown slots in order, then the legacy
+        # reference_images_2), as Image N. Every collected image is sent (_build_contents only warns past the cap).
+        prompt, warnings = luna_naming.replace(prompt, None, "cloud", {"image": len(refs)})
+        for w in warnings:
+            print(f"[Luna-GeminiImage] {w}")
 
         config = cls._build_config(types, model, caps, aspect_ratio, resolution,
                                    temperature, top_p, top_k, seed,

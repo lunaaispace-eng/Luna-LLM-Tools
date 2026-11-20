@@ -27,8 +27,10 @@ git clone https://github.com/lunaaispace-eng/Luna-LLM-Tools
 
 ## Node tree
 
-- **Luna-LLMPrompt**: Writes prompts with a local GGUF model (llama-cpp); reads pictures from Luna-ImageLoader `refs`.
-- **Luna-LLMPromptAPI**: Writes prompts with cloud, LM Studio or subscription models; reads Luna-ImageLoader `refs` too.
+- **Luna-LLMPrompt**: Writes prompts with a local GGUF model (llama-cpp); reads pictures from Luna-ImageLoader `refs`;
+  turns your @image1, @video1, @audio1 into the target model's tags.
+- **Luna-LLMPromptAPI**: Writes prompts with cloud, LM Studio or subscription models; reads Luna-ImageLoader `refs` and
+  turns @ names into tags too.
 - **Luna-StylePrompt**: Picks an image style from a categorized library.
 - **Luna-CombineStyles**: Blends up to 3 styles; the first one leads.
 - **Luna-LoadImageForCaption**: Loads the next uncaptioned image in a folder, one per run.
@@ -43,6 +45,8 @@ git clone https://github.com/lunaaispace-eng/Luna-LLM-Tools
 - **Luna-GrokVideoFrames**: Grok video from start and end frames.
 - **Luna-GrokVideoEdit**: Grok video edit with your API key.
 - **Luna-GrokVideoExtend**: Grok video extension with your API key.
+- The image and video nodes above also turn an @image1 typed into their `prompt` into the tag their model reads
+  (details: [docs/README-LLM_Prompt.md](docs/README-LLM_Prompt.md), @ names).
 
 ## Replaces
 

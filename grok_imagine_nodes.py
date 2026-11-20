@@ -32,6 +32,8 @@ import numpy as np
 import torch
 from PIL import Image
 
+from . import luna_naming
+
 XAI_BASE_URL = "https://api.x.ai/v1"
 _KEY_NAMES = ("XAI_API_KEY", "GROK_API_KEY")
 
@@ -299,7 +301,25 @@ def _video_output(url: str, key: str | None = None):
 
 _SEED = ("INT", {"default": 0, "min": 0, "max": 2147483647, "control_after_generate": True,
                  "tooltip": "Re-run trigger; results are nondeterministic regardless of seed."})
-_PROMPT = ("STRING", {"multiline": True, "default": "", "tooltip": "Text prompt."})
+
+
+def _prompt_in(tip: str) -> tuple:
+    """A node's prompt input with its own tooltip (what @imageN means on that node)."""
+    return ("STRING", {"multiline": True, "default": "", "tooltip": tip})
+
+
+_AT_WORDS = "One with no such image is sent as words, with a warning in the console."
+
+
+def _at_names(node_id: str, prompt: str, images: int = 0, clips: int = 0) -> str:
+    """The user's @ names in a Grok prompt: @imageN -> <IMAGE_{N-1}>, N being the image's place among those the
+    node sends, in the order its tooltip states. One with no such image, and every @videoN / @audioN (the Grok
+    row has no clip or sound tag), becomes words; the warnings go to the console."""
+    text, warnings = luna_naming.replace(prompt, None, "grok", {"image": images, "video": clips})
+    for w in warnings:
+        print(f"[{node_id}] {w}")
+    return text
+
 
 # Optional connectable size inputs (e.g. from Resolution-Master). When both are
 # wired (>0) they pick the nearest supported aspect_ratio from the dims; image
@@ -342,7 +362,8 @@ class GrokImageAPINode:
     def INPUT_TYPES(cls):
         return {"required": {
             "model": (_IMAGE_MODELS,),
-            "prompt": _PROMPT,
+            "prompt": _prompt_in("Text prompt. This node takes no image, so an @image1 is sent as words, "
+                                 "with a warning in the console."),
             "aspect_ratio": (_IMAGE_AR + ["auto"], {
                 "tooltip": "'auto' (the API default) lets the model pick."}),
             "number_of_images": ("INT", {"default": 1, "min": 1, "max": 10}),
@@ -366,6 +387,7 @@ class GrokImageAPINode:
             raise ValueError("Prompt is required.")
         if width and height and width > 0 and height > 0:
             aspect_ratio = _nearest_ar(int(width), int(height), _IMAGE_AR)
+        prompt = _at_names("Luna-GrokImage", prompt)
         key = _resolve_xai_key()
         body = {
             "model": model, "prompt": prompt, "aspect_ratio": aspect_ratio,
@@ -399,7 +421,9 @@ class GrokImageEditAPINode:
         return {"required": {
             "model": (_IMAGE_MODELS,),
             "image": ("IMAGE",),
-            "prompt": _PROMPT,
+            "prompt": _prompt_in("Text prompt. Point at an input with @image1, @image2 ...: the images of "
+                                 "`image` in batch order, the first being the one edited; sent as <IMAGE_0>, "
+                                 "<IMAGE_1> ... " + _AT_WORDS),
             "resolution": (["1K", "1.5K", "2K"],),
             "number_of_images": ("INT", {"default": 1, "min": 1, "max": 10}),
             "aspect_ratio": (["auto"] + _IMAGE_AR,),
@@ -428,6 +452,7 @@ class GrokImageEditAPINode:
             aspect_ratio = _nearest_ar(int(width), int(height), _IMAGE_AR)
         if aspect_ratio != "auto" and n_in == 1:
             raise ValueError("Custom aspect ratio is only allowed when multiple images are connected.")
+        prompt = _at_names("Luna-GrokImageEdit", prompt, images=n_in)
         key = _resolve_xai_key()
         resp = _post("/images/edits", key, {
             "model": model,
@@ -445,10 +470,6 @@ class GrokImageEditAPINode:
 
 _GEN_AUDIO = ("BOOLEAN", {"default": True,
                           "tooltip": "Off strips the audio track (live-checked on 1.5 and lite)."})
-_PROMPT_OPT = ("STRING", {"multiline": True, "default": "",
-                          "tooltip": "Text prompt. Optional when an image, reference or frame "
-                                     "is connected. Refer to inputs as <IMAGE_0>, <IMAGE_1>... "
-                                     "and voices as <AUDIO_0>..."})
 
 
 def _video_ar(aspect_ratio: str):
@@ -468,7 +489,8 @@ class GrokVideoAPINode:
             "model": (_VIDEO_MODELS, {"tooltip": "1.5 $0.08/s at 480p (~$0.25/s at 1080p); "
                                                  "1.5-lite ~$0.02/s 480p, $0.03/s 720p, "
                                                  "$0.14/s 1080p (measured); classic $0.05/s."}),
-            "prompt": _PROMPT_OPT,
+            "prompt": _prompt_in("Text prompt. Optional when an image is connected. @image1 is the `image` "
+                                 "input, sent as <IMAGE_0>. " + _AT_WORDS),
             "resolution": (_VIDEO_RES,),
             "aspect_ratio": (_VIDEO_AR,),
             "duration": ("INT", {"default": 6, "min": 1, "max": 15}),
@@ -498,6 +520,8 @@ class GrokVideoAPINode:
             if len(frames) != 1:
                 raise ValueError("Only one input image is supported (use Reference-to-Video for more).")
             body["image"] = {"url": _tensor_to_data_uri(frames[0])}
+        if "prompt" in body:
+            body["prompt"] = _at_names("Luna-GrokVideo", body["prompt"], images=1 if image is not None else 0)
         init = _post("/videos/generations", key, body, timeout=float(timeout_seconds))
         url = _poll_video(init["request_id"], key, poll_timeout=float(timeout_seconds))
         return (_video_output(url, key),)
@@ -522,7 +546,10 @@ class GrokVideoReferenceAPINode:
         return {"required": {
             "model": (["grok-imagine-video-1.5"], {
                 "tooltip": "Only 1.5 does reference-to-video; lite and classic are rejected."}),
-            "prompt": _PROMPT_OPT,
+            "prompt": _prompt_in("Text prompt. Optional when an image, reference or voice is connected. "
+                                 "@image1, @image2 ... count first_frame (when connected) and then "
+                                 "reference_images in batch order, sent as <IMAGE_0>, <IMAGE_1> ...; voices "
+                                 "are <AUDIO_0> ... (write those tags as they are). " + _AT_WORDS),
             "resolution": (["480p", "720p"],),  # any reference request at 1080p is a 400
             "aspect_ratio": (_VIDEO_AR,),
             "duration": ("INT", {"default": 6, "min": 1, "max": 15}),
@@ -572,6 +599,10 @@ class GrokVideoReferenceAPINode:
             body["reference_audios"] = voices
         if first_frame is not None:
             body["image"] = {"url": _tensor_to_data_uri(next(_iter_images(first_frame)))}
+        if "prompt" in body:
+            # Numbering as the first_frame tooltip states: the pinned first frame is <IMAGE_0>, the references follow.
+            body["prompt"] = _at_names("Luna-GrokVideoReference", body["prompt"],
+                                       images=(1 if first_frame is not None else 0) + len(frames))
         init = _post("/videos/generations", key, body, timeout=float(timeout_seconds))
         url = _poll_video(init["request_id"], key, poll_timeout=float(timeout_seconds))
         return (_video_output(url, key),)
@@ -596,7 +627,10 @@ class GrokVideoFramesAPINode:
         return {"required": {
             "model": (["grok-imagine-video-1.5"], {"tooltip": "1.5 only - lite and classic reject "
                                                               "last_frame and keyframes."}),
-            "prompt": _PROMPT_OPT,
+            "prompt": _prompt_in("Text prompt. Optional when a frame is connected. @image1, @image2 ... "
+                                 "count what is sent, in this order: first_frame, last_frame, the keyframes "
+                                 "by time, then reference_images; sent as <IMAGE_0>, <IMAGE_1> ... "
+                                 + _AT_WORDS),
             "resolution": (["480p", "720p"],),  # 1080p is a 400 with frames
             "aspect_ratio": (_VIDEO_AR,),
             "duration": ("INT", {"default": 6, "min": 1, "max": 15}),
@@ -651,6 +685,11 @@ class GrokVideoFramesAPINode:
             if len(refs) > _MAX_REFS:
                 raise ValueError(f"xAI takes at most {_MAX_REFS} reference images.")
             body["reference_images"] = [{"url": _tensor_to_data_uri(f)} for f in refs]
+        if "prompt" in body:
+            # Numbered in the order the body carries them: image (first frame), last_frame, keyframes, references.
+            sent = ((first_frame is not None) + (last_frame is not None) + len(keyframes)
+                    + len(body.get("reference_images") or []))
+            body["prompt"] = _at_names("Luna-GrokVideoFrames", body["prompt"], images=int(sent))
         init = _post("/videos/generations", key, body, timeout=float(timeout_seconds))
         url = _poll_video(init["request_id"], key, poll_timeout=float(timeout_seconds))
         return (_video_output(url, key),)
@@ -666,7 +705,8 @@ class GrokVideoEditAPINode:
     def INPUT_TYPES(cls):
         return {"required": {
             "model": (_VIDEO_EDIT_MODELS, {"tooltip": "Only the classic model accepts edits."}),
-            "prompt": _PROMPT,
+            "prompt": _prompt_in("Text prompt. Grok has no tag for the input clip, so an @video1 (or "
+                                 "@image1) is sent as words, with a warning in the console."),
             "video": ("VIDEO", {"tooltip": "mp4. Output keeps its duration (capped at 8.7 s) "
                                            "and aspect ratio, at most 720p."}),
             "seed": _SEED,
@@ -676,6 +716,7 @@ class GrokVideoEditAPINode:
     def generate(self, model, prompt, video, seed, timeout_seconds):
         if not prompt.strip():
             raise ValueError("Prompt is required.")
+        prompt = _at_names("Luna-GrokVideoEdit", prompt, clips=1)
         key = _resolve_xai_key()
         init = _post("/videos/edits", key, {
             "model": model, "prompt": prompt,
@@ -695,7 +736,8 @@ class GrokVideoExtendAPINode:
     def INPUT_TYPES(cls):
         return {"required": {
             "model": (_VIDEO_EDIT_MODELS, {"tooltip": "Only the classic model accepts extensions."}),
-            "prompt": _PROMPT,
+            "prompt": _prompt_in("Text prompt. Grok has no tag for the input clip, so an @video1 (or "
+                                 "@image1) is sent as words, with a warning in the console."),
             "video": ("VIDEO",),
             # Live: 2-10 ("Duration must be between 2 and 10 seconds"), and it is
             # the length ADDED, not the total. The old 2-15 / default 8 failed
@@ -709,6 +751,7 @@ class GrokVideoExtendAPINode:
     def generate(self, model, prompt, video, duration, seed, timeout_seconds):
         if not prompt.strip():
             raise ValueError("Prompt is required.")
+        prompt = _at_names("Luna-GrokVideoExtend", prompt, clips=1)
         key = _resolve_xai_key()
         init = _post("/videos/extensions", key, {
             "model": model, "prompt": prompt,

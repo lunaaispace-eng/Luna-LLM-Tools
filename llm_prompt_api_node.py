@@ -42,6 +42,9 @@ from .llm_prompt_node import (
     _refs_pictures,
     _refs_brief,
     _pictures_log,
+    _preset_row,
+    _naming_prepare,
+    _naming_finish,
 )
 from . import age_guard
 from .output_cleaner import (OutputCleanConfig, clean_model_output, normalize_prompt_separator, split_positive_negative,
@@ -2748,7 +2751,12 @@ class LLMPromptAPINode(io.ComfyNode):
                 io.String.Input("custom_system_prompt", multiline=True, default="",
                                 tooltip="Override the preset. If non-empty, replaces whatever the preset would have been."),
                 io.String.Input("user_prompt", multiline=True, default="",
-                                tooltip="Your scene concept, subject, idea."),
+                                tooltip="Your scene concept, subject, idea. Point at a picture with @image1, @image2 ... "
+                                        "(@video1, @audio1 for clips and sounds): N is the card number on "
+                                        "Luna-H3-AssetLoader or Luna-ImageLoader, else the place the picture is sent "
+                                        "here (image frames, then refs). The PICTURES block shows the model each name's "
+                                        "tag; an @ name left in positive or negative is replaced by that tag, and one "
+                                        "with no such picture becomes words and a warning on log."),
                 io.Combo.Input("output_format", options=["text", "json", "list"], default="text",
                                tooltip="text = plain prompt paragraph. json = forced JSON output. list = numbered multi-scene list (for LTX video tracks)."),
                 io.Boolean.Input("split_output", default=True,
@@ -2837,10 +2845,11 @@ class LLMPromptAPINode(io.ComfyNode):
                                  tooltip="LM Studio only. ON = unload the model after the run, but only if this run loaded it. A model that was already loaded stays loaded."),
                 # Added last (2026-11-16): a socket-only input, so saved widget positions are unchanged.
                 io.String.Input("asset_brief", optional=True, force_input=True,
-                                tooltip="The asset_brief from Luna-H3-AssetLoader: one line naming each wired picture as "
-                                        "<Picture N> with its true size and ratio. Sent as a PICTURES block, so the "
-                                        "model knows which picture is which and each one's real shape even when the "
-                                        "image batch is letterboxed."),
+                                tooltip="The asset_brief from Luna-H3-AssetLoader, Luna-H3-RefsOut or Luna-ImageLoader: each "
+                                        "wired picture with its tag, true size and ratio, and the '@ names:' line mapping each "
+                                        "@imageN / @videoN / @audioN to its tag. Sent as a PICTURES block, with that line written "
+                                        "in the preset's tags, so the model knows which picture is which and each one's real "
+                                        "shape even when the image batch is letterboxed."),
                 # Added last (S7): a socket-only input, so saved widget positions are unchanged.
                 io.Custom("LUNA_H3_REFS").Input(
                     "refs", optional=True,
@@ -2959,6 +2968,12 @@ class LLMPromptAPINode(io.ComfyNode):
             pictures_log = _pictures_log([("image", n_image), ("video", len(images_b64) - n_image),
                                           ("refs", len(labelled_images))])
 
+        # The user's @ names. Pictures sent, in order: the `image` frames, then the `refs` pictures (the sampled
+        # video frames between them are a clip, not pictures). The PICTURES text with the map in the preset's row
+        # goes in as the core's asset_brief; positive / negative are replaced after.
+        naming = _naming_prepare(asset_brief, refs, user_prompt, _preset_row(system_prompt, custom_system_prompt),
+                                 n_image + len(labelled_images))
+
         try:
             positive, negative, log = write_prompt_api(
                 provider=provider, model_name=model_name, system_prompt=system_prompt,
@@ -2976,7 +2991,7 @@ class LLMPromptAPINode(io.ComfyNode):
                 video_sample_frames=video_sample_frames, gemini_video_fps=gemini_video_fps,
                 quality=quality, min_p=min_p, repeat_penalty=repeat_penalty,
                 context_length=context_length, unload_after_run=unload_after_run, audio=audio,
-                asset_brief=_refs_brief(asset_brief, refs), labelled_images=labelled_images,
+                asset_brief=naming["brief"] or _refs_brief(asset_brief, refs), labelled_images=labelled_images,
             )
         except age_guard.AgeGuardError as exc:
             # Skip only what this prompt feeds; the rest of the graph and the queue run on.
@@ -2988,6 +3003,8 @@ class LLMPromptAPINode(io.ComfyNode):
             print(f"[Luna-LLMPromptAPI] {line}")
         if head:
             log = "\n".join(head + ([log] if log else []))
+        # The @ names: outputs replaced, and the naming lines lead the log (as on Luna-LLMPrompt).
+        positive, negative, log = _naming_finish(naming, positive, negative, log, "Luna-LLMPromptAPI")
 
         # The node face reads these in onExecuted: the last-run line and its
         # "view thinking" link.
